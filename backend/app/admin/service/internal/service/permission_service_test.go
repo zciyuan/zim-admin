@@ -1,0 +1,779 @@
+// PermissionService 的 SQLite 内存库集成测试（白盒，包内测试）。
+//
+// 覆盖目标：
+//   - init() 播种链：权限组缺失时默认权限首条即中止（外键违约）；
+//     权限组齐备时首条（无关联资源）落库、第二条（关联不存在的
+//     api/menu）中止；非空表二次 init 不重复播种。
+//   - syncWithOpenAPI 空路径分支（含既定空壳测试 TestPermissionService_syncWithOpenAPI_EmptyPaths）：
+//     无 paths 键的文档 → "paths is nil" 内部错误且不落行；
+//     空 paths 对象 → 同步空集成功；真实内嵌文档 → 接口表播种（SyncApis 全链路）。
+//   - SyncPermissions 菜单派生 + 接口派生：目录菜单成组、子菜单成权限、
+//     菜单路径一级段决定归属模块、接口代码前缀匹配模块后生成接口派生权限、
+//     权限-组关联（GroupID）与权限-菜单/权限-接口关联行落库、未分类默认组恒建。
+//   - List/Get 的租户范围限定：租户操作人无任何可见权限 → 空列表 / Forbidden；
+//     平台操作人全量可见 + GroupName 富集（组存在时回填组名）。
+//   - Create/Update/Delete：参数校验、操作人盖章、单字段掩码更新、删除清空。
+//
+// 跳过项：真实 Casbin 策略引擎（authorizer 一律 noop 引擎 + 桩 provider）、
+// 跨实例策略重载广播。
+package service
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"github.com/tx7do/go-utils/trans"
+	bLogger "github.com/tx7do/kratos-bootstrap/logger"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
+
+	paginationV1 "github.com/tx7do/go-crud/api/gen/go/pagination/v1"
+
+	crudViewer "github.com/tx7do/go-crud/viewer"
+	"github.com/tx7do/go-utils/authorizer"
+	goconv "github.com/tx7do/go-utils/converter"
+	adminV1 "go-wind-admin/api/gen/go/admin/service/v1"
+	authenticationV1 "go-wind-admin/api/gen/go/authentication/service/v1"
+	permissionV1 "go-wind-admin/api/gen/go/permission/service/v1"
+	"go-wind-admin/app/admin/service/cmd/server/assets"
+	"go-wind-admin/app/admin/service/internal/data"
+	"go-wind-admin/app/admin/service/internal/data/ent"
+	"go-wind-admin/app/admin/service/internal/data/enttest"
+	"go-wind-admin/app/admin/service/internal/data/ent/menu"
+	"go-wind-admin/app/admin/service/internal/data/ent/permission"
+	"go-wind-admin/app/admin/service/internal/data/ent/permissiongroup"
+	"go-wind-admin/app/admin/service/internal/data/ent/permissionmenu"
+	"go-wind-admin/app/admin/service/internal/data/ent/permissionpolicy"
+	"go-wind-admin/app/admin/service/internal/data/ent/rolepermission"
+	"go-wind-admin/pkg/constants"
+	"go-wind-admin/pkg/middleware/auth"
+	"go-wind-admin/pkg/utils/converter"
+)
+
+// newPermissionServiceForTest 白盒构造 PermissionService，逐字段对齐
+// NewPermissionService 的装配（log 用 NopLogger helper；除 PermissionRepo 外
+// 的 repo 均用 testkit 构造器；PermissionRepo 无 testkit 导出，按生产构造器 +
+// NopLogger 的 bootstrap 上下文构造，唯一差异仍是日志；converter 与生产一致）。
+// init() 不在构造时调用，由用例按需触发。
+func newPermissionServiceForTest(t *testing.T) (*PermissionService, *ent.Client) {
+	t.Helper()
+	entClient := enttest.NewEntClientForTest(t)
+	svc := &PermissionService{
+		log:                     bLogger.NewHelper(bLogger.NopLogger()),
+		permissionRepo:          data.NewPermissionRepoForTest(entClient),
+		permissionGroupRepo:     data.NewPermissionGroupRepoForTest(entClient),
+		menuRepo:                data.NewMenuRepoForTest(entClient),
+		apiRepo:                 data.NewApiRepoForTest(entClient),
+		roleRepo:                data.NewRoleRepoForTest(entClient),
+		authorizer:              authorizer.NewAuthorizer(context.Background(), bLogger.NopLogger(), &authorizer.EngineConfig{Type: "noop"}, stubAuthzProvider{}),
+		menuPermissionConverter: converter.NewMenuPermissionConverter(),
+		apiPermissionConverter:  goconv.NewApiPermissionConverter(),
+	}
+	return svc, entClient.Client()
+}
+
+// seedPermissionGroups 落 count 条占位权限组（自动 ID 从 1 顺次递增）。
+func seedPermissionGroups(t *testing.T, svc *PermissionService, ctx context.Context, count int) {
+	t.Helper()
+	for i := 1; i <= count; i++ {
+		_, err := svc.permissionGroupRepo.Create(ctx, &permissionV1.CreatePermissionGroupRequest{
+			Data: &permissionV1.PermissionGroup{
+				Name:      trans.Ptr("PermSvcGroup"),
+				Module:    trans.Ptr("perm_svc_group"),
+				SortOrder: trans.Ptr(uint32(i)),
+				Status:    permissionV1.PermissionGroup_ON.Enum(),
+			},
+		})
+		require.NoError(t, err, "落占位权限组 %d 应成功", i)
+	}
+}
+
+// TestPermissionService_InitSeeding 验证 init() 的默认权限播种：
+// 空表播种全部默认权限（关联资源缺失不中止——关联表无外键强制、
+// CleanNotExist 与批量插入对缺失资源静默无操作），非空表二次 init 不重复播种。
+func TestPermissionService_InitSeeding(t *testing.T) {
+	svc, client := newPermissionServiceForTest(t)
+	ctx := enttest.NewSystemContext(context.Background())
+
+	svc.init()
+	cnt, err := client.Permission.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, len(constants.DefaultPermissions), int(cnt),
+		"init() 空表应把全部默认权限落库")
+
+	svc.init()
+	cnt2, err := client.Permission.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, cnt, cnt2, "非空表二次 init 不应重复播种")
+}
+
+// TestPermissionService_InitSkipsSyncWhenNoApisOrMenus 验证 init() 的
+// SyncPermissions 触发条件：api 表或菜单表为空时（此例两表皆空）
+// 即使权限表为空播种后也不触发同步（menusCount==0 分支）。
+func TestPermissionService_InitSkipsSyncWhenNoApisOrMenus(t *testing.T) {
+	svc, client := newPermissionServiceForTest(t)
+	ctx := enttest.NewSystemContext(context.Background())
+	seedPermissionGroups(t, svc, ctx, 5)
+
+	svc.init()
+
+	groupCnt, err := client.PermissionGroup.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 5, groupCnt, "占位组应保持 5 条（SyncPermissions 未触发，未追加未分类组）")
+}
+
+// TestPermissionService_syncWithOpenAPI_EmptyPaths（原空壳测试的实装）：
+// 无 paths 键的文档 → "paths is nil" 内部错误且接口表不落行；
+// 空 paths 对象 → 同步空集成功不落行；真实内嵌文档 → SyncApis 播种接口表。
+func TestPermissionService_syncWithOpenAPI_EmptyPaths(t *testing.T) {
+	entClient := enttest.NewEntClientForTest(t)
+	apiSvc := newApiServiceForTest(t, entClient)
+	ctx := enttest.NewSystemContext(context.Background())
+
+	orig := assets.OpenApiData
+	defer func() { assets.OpenApiData = orig }()
+
+	// 无 paths 键：加载成功但 Paths==nil → 内部错误
+	assets.OpenApiData = []byte("openapi: 3.0.0\ninfo:\n  title: empty-paths-test\n  version: \"1.0\"\n")
+	var apis []*permissionV1.Api
+	apis, err := apiSvc.loadApisFromOpenAPI(ctx)
+	require.Error(t, err, "无 paths 键的文档应触发 paths is nil 内部错误")
+	require.True(t, adminV1.IsInternalServerError(err))
+	require.ErrorContains(t, err, "paths is nil", "应命中 Paths==nil 分支")
+	cnt, qerr := entClient.Client().Api.Query().Count(ctx)
+	require.NoError(t, qerr)
+	require.Zero(t, cnt, "失败分支不应落任何接口行")
+
+	// 空 paths 对象：同步空集成功
+	assets.OpenApiData = []byte("openapi: 3.0.0\ninfo:\n  title: empty-paths-test\n  version: \"1.0\"\npaths: {}\n")
+	apis, err = apiSvc.loadApisFromOpenAPI(ctx)
+	require.NoError(t, err, "空 paths 对象应加载成功")
+	require.Empty(t, apis, "空 paths 对象不应产出端点")
+	added, _, _, serr := apiSvc.repo.SyncMerge(ctx, apis, 0)
+	require.NoError(t, serr, "空集合同步应成功")
+	require.Zero(t, added, "空集合同步不应新增")
+	cnt, qerr = entClient.Client().Api.Query().Count(ctx)
+	require.NoError(t, qerr)
+	require.Zero(t, cnt, "空集同步不应落行")
+
+	// 真实内嵌文档：SyncApis 全链路播种接口表（SyncApis 已是平台管理员闸门，
+	// 用平台管理员上下文调用）
+	assets.OpenApiData = orig
+	_, err = apiSvc.SyncApis(auth.NewContext(ctx, &authenticationV1.UserTokenPayload{UserId: 7, IsPlatformAdmin: trans.Ptr(true)}), &emptypb.Empty{})
+	require.NoError(t, err, "真实文档的 SyncApis 应成功")
+	cnt, qerr = entClient.Client().Api.Query().Count(ctx)
+	require.NoError(t, qerr)
+	require.Greater(t, cnt, 0, "SyncApis 应从内嵌文档播种接口表")
+	listResp, lerr := apiSvc.List(ctx, &paginationV1.PagingRequest{})
+	require.NoError(t, lerr)
+	require.Equal(t, int64(cnt), listResp.GetTotal(), "List 应返回同步后的全量行")
+	require.Len(t, listResp.GetItems(), cnt)
+}
+
+// TestPermissionService_SyncPermissions_MenuAndApiDerived 验证权限同步的
+// 菜单派生与接口派生：目录菜单生成组、子菜单生成权限、一级路径段决定归属
+// 模块、接口代码经前缀匹配模块后生成接口派生权限；关联行（权限-组、
+// 权限-菜单、权限-接口）落库；未分类默认组恒建。
+func TestPermissionService_SyncPermissions_MenuAndApiDerived(t *testing.T) {
+	svc, client := newPermissionServiceForTest(t)
+	ctx := enttest.NewSystemContext(context.Background())
+	opCtx := auth.NewContext(ctx, &authenticationV1.UserTokenPayload{UserId: 7, IsPlatformAdmin: trans.Ptr(true)})
+
+	// 目录菜单（根）与页面菜单（子）
+	require.NoError(t, svc.menuRepo.Create(ctx, &permissionV1.CreateMenuRequest{
+		Data: &permissionV1.Menu{
+			Name:   trans.Ptr("PermSvc 目录菜单"),
+			Path:   trans.Ptr("/bizgrp"),
+			Type:   permissionV1.Menu_CATALOG.Enum(),
+			Status: permissionV1.Menu_ON.Enum(),
+		},
+	}))
+	rootRows, err := client.Menu.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, rootRows, 1)
+	rootID := rootRows[0].ID
+	require.NoError(t, svc.menuRepo.Create(ctx, &permissionV1.CreateMenuRequest{
+		Data: &permissionV1.Menu{
+			Name:     trans.Ptr("PermSvc 子菜单"),
+			Path:     trans.Ptr("childpg"),
+			ParentId: &rootID,
+			Type:     permissionV1.Menu_MENU.Enum(),
+			Status:   permissionV1.Menu_ON.Enum(),
+		},
+	}))
+
+	// 接口行：资源段与目录菜单一级段同前缀（状态缺省即 ON）
+	require.NoError(t, svc.apiRepo.Create(ctx, &permissionV1.CreateApiRequest{
+		Data: &permissionV1.Api{
+			Path:   trans.Ptr("/api/v1/bizgrp/entries"),
+			Method: trans.Ptr("GET"),
+			Scope:  permissionV1.Api_ADMIN.Enum(),
+		},
+	}))
+
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err, "SyncPermissions 应成功")
+
+	// 权限组：未分类默认组 + 目录菜单一级段派生组
+	groups, err := client.PermissionGroup.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, groups, 2, "应恰好出现未分类组与目录菜单派生组")
+	modules := map[string]int64{}
+	var uncategorizedName string
+	for _, g := range groups {
+		require.NotNil(t, g.Module)
+		require.NotNil(t, g.Name)
+		modules[*g.Module] = g.ID
+		if *g.Module == "uncategorized" {
+			uncategorizedName = *g.Name
+		}
+	}
+	require.Len(t, modules, 2, "两个组的模块标识应互不相同")
+	require.Equal(t, "未分类", uncategorizedName, "未分类组名应为固定文案")
+	bizGroupID, hasBiz := modules["bizgrp"]
+	require.True(t, hasBiz, "目录菜单一级段应派生 bizgrp 组")
+
+	// 权限：菜单派生两条（目录/子页面）+ 接口派生一条，全部归组 bizgrp
+	perms, err := client.Permission.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, perms, 3, "应落两条菜单派生权限与一条接口派生权限")
+	codes := map[string]bool{}
+	for _, p := range perms {
+		require.NotNil(t, p.Code, "派生权限应带代码")
+		require.NotNil(t, p.GroupID, "派生权限应归组")
+		require.Equal(t, bizGroupID, *p.GroupID, "派生权限应归入同模块组")
+		codes[*p.Code] = true
+	}
+	require.True(t, codes["bizgrp:dir"], "目录菜单应派生 <一级段>:dir 代码权限（转换器钉死语义）")
+	require.True(t, codes["childpg:view"], "子页面菜单应派生 <子段>:view 代码权限（首段丢弃语义）")
+
+	// 关联行：权限-菜单两条、权限-接口一条（接口派生权限关联到接口行）
+	menuLinks, err := client.PermissionMenu.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, menuLinks, "两条菜单派生权限应各建一条权限-菜单关联")
+	apiLinks, err := client.PermissionApi.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, apiLinks, "接口派生权限应建一条权限-接口关联")
+}
+
+// TestPermissionService_SyncPermissions_DuplicateCodeDeduped 验证不同层级的菜单
+// 推导出同一权限码时（如菜单同步 MERGE 后新旧路径形态并存），同步不撞 code
+// 唯一约束整批失败，且同码只落一条、保留条目关联到来源菜单。
+func TestPermissionService_SyncPermissions_DuplicateCodeDeduped(t *testing.T) {
+	svc, client := newPermissionServiceForTest(t)
+	ctx := enttest.NewSystemContext(context.Background())
+	opCtx := auth.NewContext(ctx, &authenticationV1.UserTokenPayload{UserId: 7, IsPlatformAdmin: trans.Ptr(true)})
+
+	// 扁平旧菜单（id 小）：/profile 独段成码 profile
+	require.NoError(t, svc.menuRepo.Create(ctx, &permissionV1.CreateMenuRequest{
+		Data: &permissionV1.Menu{
+			Name:   trans.Ptr("旧-个人中心"),
+			Path:   trans.Ptr("/profile"),
+			Type:   permissionV1.Menu_MENU.Enum(),
+			Status: permissionV1.Menu_ON.Enum(),
+		},
+	}))
+	// 嵌套新菜单（id 大）：/opm 下 profile 子段，同码 profile
+	require.NoError(t, svc.menuRepo.Create(ctx, &permissionV1.CreateMenuRequest{
+		Data: &permissionV1.Menu{
+			Name:   trans.Ptr("组织目录"),
+			Path:   trans.Ptr("/opm"),
+			Type:   permissionV1.Menu_CATALOG.Enum(),
+			Status: permissionV1.Menu_ON.Enum(),
+		},
+	}))
+	rows, err := client.Menu.Query().All(ctx)
+	require.NoError(t, err)
+	var catalogID int64
+	for _, r := range rows {
+		if r.Path != nil && *r.Path == "/opm" {
+			catalogID = r.ID
+		}
+	}
+	require.NoError(t, svc.menuRepo.Create(ctx, &permissionV1.CreateMenuRequest{
+		Data: &permissionV1.Menu{
+			Name:     trans.Ptr("新-个人中心"),
+			Path:     trans.Ptr("profile"),
+			ParentId: &catalogID,
+			Type:     permissionV1.Menu_MENU.Enum(),
+			Status:   permissionV1.Menu_ON.Enum(),
+		},
+	}))
+
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err, "重复权限码应被去重而不是整批插入失败")
+
+	perms, err := client.Permission.Query().All(ctx)
+	require.NoError(t, err)
+	var matched []*ent.Permission
+	for _, p := range perms {
+		if p.Code != nil && *p.Code == "profile:view" {
+			matched = append(matched, p)
+		}
+	}
+	require.Len(t, matched, 1, "同码权限应只落一条")
+	require.NotNil(t, matched[0].Name)
+	menuLinks, err := client.PermissionMenu.Query().Count(ctx)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, menuLinks, 1, "保留的权限应关联到其来源菜单")
+}
+
+// TestPermissionService_ListAndGetTenantScoping 验证 List/Get 的租户范围限定
+// 与平台侧全量可见 + 组名富集。
+func TestPermissionService_ListAndGetTenantScoping(t *testing.T) {
+	svc, _ := newPermissionServiceForTest(t)
+	ctx := enttest.NewSystemContext(context.Background())
+	// 预置与种子 GroupName 同名的组：GroupNames 是权限种子的分组引用键，
+	// 命中时每条权限的组引用都应落上并在 List 时经富集回填组名
+	for _, name := range []string{"系统权限", "租户管理", "审计管理"} {
+		_, err := svc.permissionGroupRepo.Create(ctx, &permissionV1.CreatePermissionGroupRequest{
+			Data: &permissionV1.PermissionGroup{
+				Name:   trans.Ptr(name),
+				Module: trans.Ptr(constants.SystemPermissionModule),
+				Status: permissionV1.PermissionGroup_ON.Enum(),
+			},
+		})
+		require.NoError(t, err, "预置种子同名组 %s 应成功", name)
+	}
+	svc.init()
+	platformCtx := auth.NewContext(ctx, &authenticationV1.UserTokenPayload{UserId: 7, IsPlatformAdmin: trans.Ptr(true)})
+	// 租户操作人：查看器须与令牌租户一致（生产由认证中间件成对注入）
+	tenantCtx := auth.NewContext(
+		crudViewer.WithContext(ctx, crudViewer.NewUserContext(8, 42, 0, "", nil)),
+		&authenticationV1.UserTokenPayload{
+			UserId: 8, TenantId: trans.Ptr(int64(42)), Roles: []string{"perm_svc_nonexistent_role"},
+		})
+
+	// 平台操作人：全量可见 + 组名富集（组行存在时每条带组引用的权限都回填组名）
+	listResp, err := svc.List(platformCtx, &paginationV1.PagingRequest{})
+	require.NoError(t, err)
+	require.Equal(t, int64(len(constants.DefaultPermissions)), listResp.GetTotal(),
+		"平台操作人应看到全部播种的默认权限")
+	require.Len(t, listResp.GetItems(), len(constants.DefaultPermissions))
+	for _, item := range listResp.GetItems() {
+		require.Contains(t, []string{"系统权限", "租户管理", "审计管理"}, item.GetGroupName(),
+			"组名命中种子引用时组名应经富集回填")
+	}
+	item := listResp.GetItems()[0]
+
+	// 租户操作人（租户查看器 + 匹配令牌）：无任何可见权限 → 空列表
+	tenantList, err := svc.List(tenantCtx, &paginationV1.PagingRequest{})
+	require.NoError(t, err)
+	require.Zero(t, tenantList.GetTotal(), "租户操作人无可见权限时应返回空列表")
+	require.Empty(t, tenantList.GetItems())
+
+	// 平台查看器 + 租户令牌声明（查看器与令牌租户不一致）：
+	// 按码查角色 ID 的租户闸门按查看器判定，拒绝平台上下文的按码查询
+	mismatchCtx := auth.NewContext(ctx, &authenticationV1.UserTokenPayload{
+		UserId: 8, TenantId: trans.Ptr(int64(42)), Roles: []string{"perm_svc_nonexistent_role"},
+	})
+	_, err = svc.List(mismatchCtx, &paginationV1.PagingRequest{})
+	require.Error(t, err, "平台查看器下的按码查角色 ID 应被租户闸门拒绝")
+	require.True(t, permissionV1.IsBadRequest(err))
+
+	// Get：平台命中；租户 Forbidden；不存在 ID 报错
+	got, err := svc.Get(platformCtx, &permissionV1.GetPermissionRequest{
+		QueryBy: &permissionV1.GetPermissionRequest_Id{Id: item.GetId()},
+	})
+	require.NoError(t, err, "平台操作人按已存在 ID 查询应命中")
+	require.NotEmpty(t, got.GetGroupName(), "单条 Get 同样应做组名富集")
+
+	_, err = svc.Get(tenantCtx, &permissionV1.GetPermissionRequest{
+		QueryBy: &permissionV1.GetPermissionRequest_Id{Id: item.GetId()},
+	})
+	require.Error(t, err, "租户操作人访问范围外权限应 Forbidden")
+	require.True(t, adminV1.IsForbidden(err))
+
+	_, err = svc.Get(platformCtx, &permissionV1.GetPermissionRequest{
+		QueryBy: &permissionV1.GetPermissionRequest_Id{Id: 9999999},
+	})
+	require.Error(t, err, "不存在的权限 ID 应报错")
+}
+
+// TestPermissionService_CreateUpdateDelete 验证权限 CRUD：参数校验、
+// 操作人盖章、单字段掩码更新（掩码外保持原值）、删除清空。
+func TestPermissionService_CreateUpdateDelete(t *testing.T) {
+	svc, client := newPermissionServiceForTest(t)
+	ctx := enttest.NewSystemContext(context.Background())
+	opCtx := auth.NewContext(ctx, &authenticationV1.UserTokenPayload{UserId: 7, IsPlatformAdmin: trans.Ptr(true)})
+
+	_, err := svc.Create(opCtx, &permissionV1.CreatePermissionRequest{})
+	require.Error(t, err, "nil Data 应拒绝")
+	require.True(t, adminV1.IsBadRequest(err))
+
+	_, err = svc.Create(opCtx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name:        trans.Ptr("PermSvc 测试权限"),
+			Code:        trans.Ptr("perm_svc_test_code"),
+			Description: trans.Ptr("初版描述"),
+			Status:      permissionV1.Permission_ON.Enum(),
+		},
+	})
+	require.NoError(t, err, "创建应成功")
+	rows, err := client.Permission.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	rowID := rows[0].ID
+	require.Equal(t, int64(7), *rows[0].CreatedBy, "创建行应盖入操作人 ID")
+	require.Equal(t, "perm_svc_test_code", *rows[0].Code, "代码应按请求落库")
+
+	// 单字段掩码更新：description 更新，name 保持
+	_, err = svc.Update(opCtx, &permissionV1.UpdatePermissionRequest{
+		Id:         rowID,
+		UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"description"}},
+		Data:       &permissionV1.Permission{Description: trans.Ptr("更新后的描述")},
+	})
+	require.NoError(t, err, "单字段掩码更新应成功")
+	after, err := client.Permission.Query().Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "更新后的描述", *after.Description, "掩码内字段 description 应被更新")
+	require.Equal(t, "PermSvc 测试权限", *after.Name, "掩码外字段 name 应保持原值")
+	require.Equal(t, int64(7), *after.UpdatedBy, "更新行应盖入操作人 ID")
+
+	_, err = svc.Delete(auth.NewContext(ctx, &authenticationV1.UserTokenPayload{UserId: 7, IsPlatformAdmin: trans.Ptr(true)}), &permissionV1.DeletePermissionRequest{
+		QueryBy: &permissionV1.DeletePermissionRequest_Id{Id: rowID},
+	})
+	require.NoError(t, err, "删除应成功")
+	cnt, err := client.Permission.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, cnt, "删除后权限表应清空")
+}
+
+
+// TestPermissionService_SyncPermissions_MergeKeepsIDsAndRoleBindings 权限同步
+// MERGE 化的零漂移回归：派生集内已存在的业务权限**原位更新保 id**——挂在它身上
+// 的角色授权（sys_role_permissions）与策略联动行（sys_permission_policies）必须
+// 原样存活；派生集消失的权限删行并级联清全部从属绑定。
+func TestPermissionService_SyncPermissions_MergeKeepsIDsAndRoleBindings(t *testing.T) {
+	svc, client := newPermissionServiceForTest(t)
+	ctx := enttest.NewSystemContext(context.Background())
+	opCtx := auth.NewContext(ctx, &authenticationV1.UserTokenPayload{UserId: 7, IsPlatformAdmin: trans.Ptr(true)})
+
+	// 两个可派生权限的菜单（MENU 类型 + 可转换 path）
+	menuA, err := client.Menu.Create().
+		SetName("SvcSyncDemoA").
+		SetPath("/svc-sync/demo-a").
+		SetType(menu.TypeMenu).
+		Save(ctx)
+	require.NoError(t, err, "直建菜单 A 应成功")
+	menuB, err := client.Menu.Create().
+		SetName("SvcSyncDemoB").
+		SetPath("/svc-sync/demo-b").
+		SetType(menu.TypeMenu).
+		Save(ctx)
+	require.NoError(t, err, "直建菜单 B 应成功")
+	codeA := svc.menuPermissionConverter.ConvertCode(*menuA.Path, *menuA.Name, permissionV1.Menu_MENU)
+	codeB := svc.menuPermissionConverter.ConvertCode(*menuB.Path, *menuB.Name, permissionV1.Menu_MENU)
+	require.NotEmpty(t, codeA, "菜单 A 应可派生权限码")
+	require.NotEmpty(t, codeB, "菜单 B 应可派生权限码")
+
+	// 首轮同步：全量插入
+	t.Logf("probe codes: codeA=%q codeB=%q", codeA, codeB)
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err, "首轮同步应成功")
+	for _, row := range mustListAllPermissions(t, client, ctx) {
+		t.Logf("seeded permission: id=%d code=%q name=%q", row.ID, derefStrPerm(row.Code), derefStrPerm(row.Name))
+	}
+	permA, err := client.Permission.Query().Where(permission.CodeEQ(codeA)).Only(ctx)
+	require.NoError(t, err, "派生权限 A 应落库")
+	permB, err := client.Permission.Query().Where(permission.CodeEQ(codeB)).Only(ctx)
+	require.NoError(t, err, "派生权限 B 应落库")
+
+	// 挂角色授权与策略联动行（漂移观测点）
+
+	roleRow, err := client.Role.Create().
+		SetName("同步保号角色").
+		SetCode("SYNC_MERGE_ROLE").
+		SetNillableTenantID(trans.Ptr(int64(42))).
+		Save(ctx)
+	require.NoError(t, err)
+
+	require.NoError(t, client.RolePermission.Create().
+		SetRoleID(roleRow.ID).
+		SetTenantID(42).
+		SetPermissionID(permA.ID).
+		Exec(ctx), "角色绑定派生权限 A 应成功")
+
+	policyRow, err := client.PermissionPolicy.Create().
+		SetPermissionID(permB.ID).
+		SetEvalOrder(1).
+		Save(ctx)
+	require.NoError(t, err, "直建策略联动行应成功")
+
+	// 二轮同步：同一派生集 → 原位更新保 id
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err, "二轮同步应成功")
+	permA2, err := client.Permission.Query().Where(permission.CodeEQ(codeA)).Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, permA.ID, permA2.ID, "MERGE 后同 code 权限 id 必须不变")
+	permB2, err := client.Permission.Query().Where(permission.CodeEQ(codeB)).Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, permB.ID, permB2.ID, "MERGE 后同 code 权限 id 必须不变（B）")
+
+	// 角色授权与策略联动原样存活
+	rpCnt, err := client.RolePermission.Query().
+		Where(rolepermission.PermissionIDEQ(permA.ID)).
+		Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, rpCnt, "权限 id 保号后角色授权必须原样存活（旧 truncate 语义下此绑定成孤儿）")
+	polCnt, err := client.PermissionPolicy.Query().
+		Where(permissionpolicy.PermissionIDEQ(permB.ID)).
+		Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, polCnt, "策略联动行应原样存活")
+
+	// 删除菜单 B → 三轮同步：B 的权限行删除并级联清角色授权/策略/菜单绑定
+	require.NoError(t, client.Menu.DeleteOneID(menuB.ID).Exec(ctx))
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err, "三轮同步应成功")
+	bCnt, err := client.Permission.Query().Where(permission.CodeEQ(codeB)).Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, bCnt, "派生集消失的权限应被删除")
+	aCnt, err := client.Permission.Query().Where(permission.CodeEQ(codeA)).Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, aCnt, "派生集内的权限不得被牵连")
+	require.Equal(t, permA.ID, permA2.ID)
+	rpGone, err := client.RolePermission.Query().
+		Where(rolepermission.PermissionIDEQ(permB.ID)).
+		Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, rpGone, "被删权限的角色授权必须级联清理，不得留悬空授权")
+	polGone, err := client.PermissionPolicy.Query().
+		Where(permissionpolicy.PermissionIDEQ(permB.ID)).
+		Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, polGone, "被删权限的策略联动行必须级联清理")
+	_ = policyRow
+}
+
+// TestPermissionService_SyncPermissions_GroupsRebuiltNotDuplicated 验证组表
+// "截断重建"语义：组 name 只有普通索引没有唯一约束，同步若漏截断会每轮翻倍；
+// 截断必须保留 sys 模块的系统组，业务组（未分类+目录派生组）整批重建。
+func TestPermissionService_SyncPermissions_GroupsRebuiltNotDuplicated(t *testing.T) {
+	svc, client := newPermissionServiceForTest(t)
+	ctx := enttest.NewSystemContext(context.Background())
+	opCtx := auth.NewContext(ctx, &authenticationV1.UserTokenPayload{UserId: 7, IsPlatformAdmin: trans.Ptr(true)})
+
+	// 目录菜单 → 派生一个业务组
+	require.NoError(t, svc.menuRepo.Create(ctx, &permissionV1.CreateMenuRequest{
+		Data: &permissionV1.Menu{
+			Name:   trans.Ptr("组重建目录"),
+			Path:   trans.Ptr("/grp-rebuild"),
+			Type:   permissionV1.Menu_CATALOG.Enum(),
+			Status: permissionV1.Menu_ON.Enum(),
+		},
+	}))
+	// 系统模块组：截断必须保留
+	require.NoError(t, client.PermissionGroup.Create().
+		SetName("同步保号系统组").
+		SetModule(constants.SystemPermissionModule).
+		SetStatus(permissiongroup.StatusOn).
+		Exec(ctx))
+
+	_, err := svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err, "首轮同步应成功")
+	afterFirst, err := client.PermissionGroup.Query().All(ctx)
+	require.NoError(t, err)
+
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err, "二轮同步应成功")
+	afterSecond, err := client.PermissionGroup.Query().All(ctx)
+	require.NoError(t, err)
+
+	require.Len(t, afterFirst, 3, "首轮后应为：未分类组 + 目录派生组 + 系统组")
+	require.Len(t, afterSecond, len(afterFirst),
+		"组表行数在两轮同步间必须稳定（name 无唯一约束，漏截断即每轮翻倍）")
+	sysCnt := 0
+	for _, g := range afterSecond {
+		if g.Module != nil && *g.Module == constants.SystemPermissionModule {
+			sysCnt++
+		}
+	}
+	require.Equal(t, 1, sysCnt, "系统模块组必须被截断保留且不重复")
+}
+
+// TestPermissionService_SyncPermissions_DisabledMenuKeepsPermission 验证删除段
+// 的防误杀守卫：管理员临时停用菜单后，其派生权限不因"不在启用派生集"被删行
+// 级联清角色授权；重新启用后再同步，权限 id 仍保持不变。
+func TestPermissionService_SyncPermissions_DisabledMenuKeepsPermission(t *testing.T) {
+	svc, client := newPermissionServiceForTest(t)
+	ctx := enttest.NewSystemContext(context.Background())
+	opCtx := auth.NewContext(ctx, &authenticationV1.UserTokenPayload{UserId: 7, IsPlatformAdmin: trans.Ptr(true)})
+
+	menuA, err := client.Menu.Create().
+		SetName("停用保活A").
+		SetPath("/keep-alive/a").
+		SetType(menu.TypeMenu).
+		Save(ctx)
+	require.NoError(t, err, "直建菜单 A 应成功")
+	menuB, err := client.Menu.Create().
+		SetName("停用保活B").
+		SetPath("/keep-alive/b").
+		SetType(menu.TypeMenu).
+		Save(ctx)
+	require.NoError(t, err, "直建菜单 B 应成功")
+	codeB := svc.menuPermissionConverter.ConvertCode(*menuB.Path, *menuB.Name, permissionV1.Menu_MENU)
+	require.NotEmpty(t, codeB, "菜单 B 应可派生权限码")
+
+	// 首轮同步：全量插入
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err, "首轮同步应成功")
+	permB, err := client.Permission.Query().Where(permission.CodeEQ(codeB)).Only(ctx)
+	require.NoError(t, err, "派生权限 B 应落库")
+
+	// 挂角色授权（防误杀的漂移观测点）
+	roleRow, err := client.Role.Create().
+		SetName("停用保活角色").
+		SetCode("KEEP_ALIVE_ROLE").
+		SetNillableTenantID(trans.Ptr(int64(42))).
+		Save(ctx)
+	require.NoError(t, err)
+	require.NoError(t, client.RolePermission.Create().
+		SetRoleID(roleRow.ID).
+		SetTenantID(42).
+		SetPermissionID(permB.ID).
+		Exec(ctx), "角色绑定派生权限 B 应成功")
+
+	// 停用菜单 B → 二轮同步：B 的权限码不在启用派生集，但仍是"活码"，
+	// 权限行与角色授权必须原样存活
+	require.NoError(t, client.Menu.UpdateOneID(menuB.ID).SetStatus(menu.StatusOff).Exec(ctx))
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err, "二轮同步应成功")
+	permB2, err := client.Permission.Query().Where(permission.CodeEQ(codeB)).Only(ctx)
+	require.NoError(t, err, "停用菜单的权限不得被删除段误杀")
+	require.Equal(t, permB.ID, permB2.ID, "停用期间权限 id 必须保持（保 id 教义不被 status 过滤击穿）")
+	codeA := svc.menuPermissionConverter.ConvertCode(*menuA.Path, *menuA.Name, permissionV1.Menu_MENU)
+	aCnt, err := client.Permission.Query().Where(permission.CodeEQ(codeA)).Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, aCnt, "启用中的菜单 A 权限不得被牵连")
+	rpCnt, err := client.RolePermission.Query().
+		Where(rolepermission.PermissionIDEQ(permB.ID)).
+		Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, rpCnt, "停用期间角色授权必须原样存活")
+
+	// 重新启用 → 三轮同步：回到派生集，id 仍不变，菜单绑定恢复
+	require.NoError(t, client.Menu.UpdateOneID(menuB.ID).SetStatus(menu.StatusOn).Exec(ctx))
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err, "三轮同步应成功")
+	permB3, err := client.Permission.Query().Where(permission.CodeEQ(codeB)).Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, permB.ID, permB3.ID, "启用后同步权限 id 仍必须不变")
+	bindCnt, err := client.PermissionMenu.Query().
+		Where(permissionmenu.PermissionIDEQ(permB.ID)).
+		Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, bindCnt, "启用后派生集恢复，权限-菜单绑定应重建")
+}
+
+
+func mustListAllPermissions(t *testing.T, client *ent.Client, ctx context.Context) []*ent.Permission {
+	t.Helper()
+	rows, err := client.Permission.Query().All(ctx)
+	require.NoError(t, err)
+	return rows
+}
+
+func derefStrPerm(p *string) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return *p
+}
+
+
+// TestPermissionService_SyncPermissions_MergeSemantics 权限同步 MERGE 的细节
+// 口径（MergeKeepsIDsAndRoleBindings 之外的补充面）：
+//   - status 保留：管理端手工停用的权限不被同步重新启用（菜单 MERGE 同口径）；
+//   - 系统权限不误删：sys: 前缀行不进派生集、删除段不得触碰；
+//   - 菜单绑定替换：派生集收缩后，旧菜单绑定整体清掉（不留旧快照）；
+//   - 幂等二轮：同派生集连续两轮同步，权限行数量与 id↔code 映射均稳定。
+func TestPermissionService_SyncPermissions_MergeSemantics(t *testing.T) {
+	svc, client := newPermissionServiceForTest(t)
+	ctx := enttest.NewSystemContext(context.Background())
+	opCtx := auth.NewContext(ctx, &authenticationV1.UserTokenPayload{UserId: 7, IsPlatformAdmin: trans.Ptr(true)})
+
+	// 两个可派生菜单
+	menuA, err := client.Menu.Create().
+		SetName("MergeSemA").SetPath("/msem/a").SetType(menu.TypeMenu).Save(ctx)
+	require.NoError(t, err)
+	menuB, err := client.Menu.Create().
+		SetName("MergeSemB").SetPath("/msem/b").SetType(menu.TypeMenu).Save(ctx)
+	require.NoError(t, err)
+	codeA := svc.menuPermissionConverter.ConvertCode(*menuA.Path, *menuA.Name, permissionV1.Menu_MENU)
+	codeB := svc.menuPermissionConverter.ConvertCode(*menuB.Path, *menuB.Name, permissionV1.Menu_MENU)
+
+	// 系统种子权限先行播种（删除段"不误删 sys:" 断言的前提）
+	require.NoError(t, svc.createDefaultPermissions(ctx), "默认权限播种应成功")
+
+	// 首轮同步：A/B 落库
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err, "首轮同步应成功")
+	permA, err := client.Permission.Query().Where(permission.CodeEQ(codeA)).Only(ctx)
+	require.NoError(t, err)
+	permB, err := client.Permission.Query().Where(permission.CodeEQ(codeB)).Only(ctx)
+	require.NoError(t, err)
+
+	// 手工停用 A（管理端口径）
+	offStatus := permission.StatusOff
+	require.NoError(t, client.Permission.UpdateOneID(permA.ID).SetStatus(offStatus).Exec(ctx))
+
+	// 系统种子权限必须在同步后原样存活（删除段不得触碰 sys: 前缀行）
+	sysRows, err := client.Permission.Query().Where(permission.CodeHasPrefix("sys:")).All(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, sysRows, "系统种子权限应已由 createDefaultPermissions 播种")
+	sysIDs := map[int64]string{}
+	for _, r := range sysRows {
+		sysIDs[r.ID] = *r.Code
+	}
+
+	// 二轮同步：status 保留 + 系统权限不误删
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err)
+	permA2, err := client.Permission.Query().Where(permission.CodeEQ(codeA)).Only(ctx)
+	require.NoError(t, err)
+	require.Equal(t, permA.ID, permA2.ID, "同 code 权限保 id")
+	require.NotNil(t, permA2.Status, "status 应有值")
+	require.Equal(t, offStatus, *permA2.Status, "手工停用的权限不得被同步重新启用")
+
+	sysRows2, err := client.Permission.Query().Where(permission.CodeHasPrefix("sys:")).All(ctx)
+	require.NoError(t, err)
+	require.Len(t, sysRows2, len(sysRows), "系统权限行数不得变化")
+	for _, r := range sysRows2 {
+		require.Equal(t, sysIDs[r.ID], *r.Code, "系统权限 id↔code 映射不得漂移")
+	}
+
+	// 菜单绑定替换语义：permB 挂菜单绑定 → 删菜单 B → 三轮同步 → B 权限行删除
+	// 且其菜单绑定随行清理（不留旧快照）
+	require.NoError(t, svc.permissionRepo.AssignSyncBindings(ctx, permB.ID, nil, []int64{menuB.ID}))
+	menuBindBefore, err := svc.permissionRepo.ListMenuFullPathsByPermissionIDs(ctx, []int64{permB.ID})
+	require.NoError(t, err)
+	require.Len(t, menuBindBefore, 1, "前置：B 应已挂菜单绑定")
+
+	require.NoError(t, client.Menu.DeleteOneID(menuB.ID).Exec(ctx))
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err)
+	bLeft, err := client.Permission.Query().Where(permission.CodeEQ(codeB)).Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, bLeft, "派生集消失的权限应被删除")
+	menuBindAfter, err := svc.permissionRepo.ListMenuFullPathsByPermissionIDs(ctx, []int64{permB.ID})
+	require.NoError(t, err)
+	require.Empty(t, menuBindAfter, "被删权限的菜单绑定应随级联清理，不留旧快照")
+
+	// 幂等三轮：同派生集（只剩 A）再同步，行数与 id↔code 映射稳定
+	rows3, err := client.Permission.Query().All(ctx)
+	require.NoError(t, err)
+	idsBefore := map[int64]string{}
+	for _, r := range rows3 {
+		idsBefore[r.ID] = *r.Code
+	}
+	_, err = svc.SyncPermissions(opCtx, &emptypb.Empty{})
+	require.NoError(t, err)
+	rows4, err := client.Permission.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows4, len(rows3), "幂等二轮后行数应稳定")
+	for _, r := range rows4 {
+		require.Equal(t, idsBefore[r.ID], *r.Code, "幂等二轮后 id↔code 映射应稳定")
+	}
+}

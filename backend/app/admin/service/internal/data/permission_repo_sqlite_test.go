@@ -1,0 +1,557 @@
+package data
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"github.com/tx7do/go-utils/mapper"
+	"github.com/tx7do/go-utils/trans"
+	bLogger "github.com/tx7do/kratos-bootstrap/logger"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
+
+	paginationV1 "github.com/tx7do/go-crud/api/gen/go/pagination/v1"
+	entCrud "github.com/tx7do/go-crud/entgo"
+
+	permissionV1 "go-wind-admin/api/gen/go/permission/service/v1"
+	"go-wind-admin/app/admin/service/internal/data/ent"
+	"go-wind-admin/app/admin/service/internal/data/ent/menu"
+	"go-wind-admin/app/admin/service/internal/data/ent/permission"
+	"go-wind-admin/app/admin/service/internal/data/ent/permissionapi"
+	"go-wind-admin/app/admin/service/internal/data/ent/permissionmenu"
+	"go-wind-admin/app/admin/service/internal/data/ent/permissionpolicy"
+	"go-wind-admin/app/admin/service/internal/data/ent/rolepermission"
+	"go-wind-admin/app/admin/service/internal/data/enttest"
+)
+
+// newPermissionRepoSqlite 在给定 enttest client 上白盒构造 PermissionRepo。
+// 与生产 NewPermissionRepo 一致：内含同库的 PermissionApiRepo / PermissionMenuRepo
+// 依赖（二者为无 init() 的简单构造）与 mapper/converter 初始化。
+func newPermissionRepoSqlite(t *testing.T, entClient *entCrud.EntClient[*ent.Client]) *PermissionRepo {
+	t.Helper()
+	permissionApiRepo := &PermissionApiRepo{
+		log:       bLogger.NewHelper(bLogger.NopLogger()),
+		entClient: entClient,
+	}
+	permissionMenuRepo := &PermissionMenuRepo{
+		log:       bLogger.NewHelper(bLogger.NopLogger()),
+		entClient: entClient,
+	}
+	rolePermissionRepo := &RolePermissionRepo{
+		log:       bLogger.NewHelper(bLogger.NopLogger()),
+		entClient: entClient,
+	}
+	repo := &PermissionRepo{
+		entClient: entClient,
+		log:       bLogger.NewHelper(bLogger.NopLogger()),
+		mapper:    mapper.NewCopierMapper[permissionV1.Permission, ent.Permission](),
+		statusConverter: mapper.NewEnumTypeConverter[permissionV1.Permission_Status, permission.Status](
+			permissionV1.Permission_Status_name, permissionV1.Permission_Status_value,
+		),
+		permissionApiRepo:  permissionApiRepo,
+		permissionMenuRepo: permissionMenuRepo,
+		rolePermissionRepo: rolePermissionRepo,
+	}
+	repo.init()
+	return repo
+}
+
+// TestPermissionRepoSqlite_Create 通过 repo.Create 写入后直查 SQLite 断言落库。
+func TestPermissionRepoSqlite_Create(t *testing.T) {
+	entClient := enttest.NewEntClientForTest(t)
+	repo := newPermissionRepoSqlite(t, entClient)
+	ctx := enttest.NewSystemContext(context.Background())
+
+	err := repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name:        trans.Ptr("sqlite权限点-创建"),
+			Code:        trans.Ptr("sqlite_perm_create_code"),
+			Status:      permissionV1.Permission_ON.Enum(),
+			Description: trans.Ptr("创建用途描述"),
+		},
+	})
+	require.NoError(t, err, "repo.Create 应写入 SQLite 成成功")
+
+	rows, err := repo.entClient.Client().Permission.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "SQLite 中应有 1 条 permission 记录")
+	require.Equal(t, "sqlite权限点-创建", *rows[0].Name, "name 应按请求落库")
+	require.Equal(t, "sqlite_perm_create_code", *rows[0].Code, "code 应按请求落库")
+	require.Equal(t, permission.StatusOn, *rows[0].Status, "status 枚举应经 converter 落为 ON")
+	require.Equal(t, "创建用途描述", *rows[0].Description, "description 应按请求落库")
+}
+
+// TestPermissionRepoSqlite_ListContainsFilter 验证 List 的 contains 模糊搜索语义。
+func TestPermissionRepoSqlite_ListContainsFilter(t *testing.T) {
+	entClient := enttest.NewEntClientForTest(t)
+	repo := newPermissionRepoSqlite(t, entClient)
+	ctx := enttest.NewSystemContext(context.Background())
+
+	require.NoError(t, repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name: trans.Ptr("权限-markerjkl-甲"),
+			Code: trans.Ptr("sqlite_perm_list_a"),
+		},
+	}))
+	require.NoError(t, repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name: trans.Ptr("权限-无关行-乙"),
+			Code: trans.Ptr("sqlite_perm_list_b"),
+		},
+	}))
+
+	filtered, err := repo.List(ctx, &paginationV1.PagingRequest{
+		FilteringType: &paginationV1.PagingRequest_FilterExpr{
+			FilterExpr: &paginationV1.FilterExpr{
+				Type: paginationV1.ExprType_AND,
+				Conditions: []*paginationV1.FilterCondition{
+					{
+						Field:      "name",
+						Op:         paginationV1.Operator_CONTAINS,
+						ValueOneof: &paginationV1.FilterCondition_Value{Value: "markerjkl"},
+					},
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), filtered.Total, "contains 过滤后 Total 应为 1")
+	require.Len(t, filtered.Items, 1, "contains 过滤后只应返回 1 行")
+	require.Contains(t, *filtered.Items[0].Name, "markerjkl", "命中行应是携带标记的行")
+
+	none, err := repo.List(ctx, &paginationV1.PagingRequest{
+		FilteringType: &paginationV1.PagingRequest_FilterExpr{
+			FilterExpr: &paginationV1.FilterExpr{
+				Type: paginationV1.ExprType_AND,
+				Conditions: []*paginationV1.FilterCondition{
+					{
+						Field:      "name",
+						Op:         paginationV1.Operator_CONTAINS,
+						ValueOneof: &paginationV1.FilterCondition_Value{Value: "no-such-marker-zzz"},
+					},
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), none.Total, "无命中 contains 应返回 Total=0")
+	require.Empty(t, none.Items)
+
+	all, err := repo.List(ctx, &paginationV1.PagingRequest{}, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), all.Total, "无过滤时应返回全部 2 行")
+	require.Len(t, all.Items, 2)
+	// 列表读视图：status 未显式指定、按列默认（ON）落库，经 queryEnumsAndBackfill
+	// 如实回显。
+	for _, item := range all.Items {
+		require.Equal(t, permissionV1.Permission_ON, item.GetStatus(), "列表读视图应回填列默认 status")
+	}
+}
+
+// TestPermissionRepoSqlite_Get 验证按 ID 与按 code 的命中/未命中。
+func TestPermissionRepoSqlite_Get(t *testing.T) {
+	entClient := enttest.NewEntClientForTest(t)
+	repo := newPermissionRepoSqlite(t, entClient)
+	ctx := enttest.NewSystemContext(context.Background())
+
+	require.NoError(t, repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name: trans.Ptr("sqlite权限点-Get"),
+			Code: trans.Ptr("sqlite_perm_get_code"),
+		},
+	}))
+	rows, err := repo.entClient.Client().Permission.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	createdID := rows[0].ID
+
+	// 命中：按 ID
+	hit, err := repo.Get(ctx, &permissionV1.GetPermissionRequest{
+		QueryBy: &permissionV1.GetPermissionRequest_Id{Id: createdID},
+	})
+	require.NoError(t, err, "按存在的 ID 查询应命中")
+	require.Equal(t, createdID, hit.GetId())
+	// 读视图（Get 按主键）：status 未显式指定、按列默认（ON）落库，经
+	// queryEnumsAndBackfill 如实回显。
+	require.Equal(t, permissionV1.Permission_ON, hit.GetStatus(), "读视图应回填列默认 status")
+
+	// 命中：按 code
+	byCode, err := repo.Get(ctx, &permissionV1.GetPermissionRequest{
+		QueryBy: &permissionV1.GetPermissionRequest_Code{Code: "sqlite_perm_get_code"},
+	})
+	require.NoError(t, err, "按存在的 code 查询应命中")
+	require.Equal(t, createdID, byCode.GetId(), "按 code 命中应带回同一行的 ID")
+	// 读视图（Get 按 code）：同上，列默认 status 如实回显。
+	require.Equal(t, permissionV1.Permission_ON, byCode.GetStatus(), "读视图应回填列默认 status")
+
+	// 未命中：不存在的 ID / 不存在的 code
+	_, err = repo.Get(ctx, &permissionV1.GetPermissionRequest{
+		QueryBy: &permissionV1.GetPermissionRequest_Id{Id: 9999999},
+	})
+	require.Error(t, err, "不存在的 ID 查询应返回错误")
+	_, err = repo.Get(ctx, &permissionV1.GetPermissionRequest{
+		QueryBy: &permissionV1.GetPermissionRequest_Code{Code: "no-such-code-zzz"},
+	})
+	require.Error(t, err, "不存在的 code 查询应返回错误")
+}
+
+// TestPermissionRepoSqlite_CodesAndIdsLookup 验证 ID↔code 双向映射查询。
+func TestPermissionRepoSqlite_CodesAndIdsLookup(t *testing.T) {
+	entClient := enttest.NewEntClientForTest(t)
+	repo := newPermissionRepoSqlite(t, entClient)
+	ctx := enttest.NewSystemContext(context.Background())
+
+	require.NoError(t, repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name: trans.Ptr("映射-甲"),
+			Code: trans.Ptr("sqlite_perm_lookup_a"),
+		},
+	}))
+	require.NoError(t, repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name: trans.Ptr("映射-乙"),
+			Code: trans.Ptr("sqlite_perm_lookup_b"),
+		},
+	}))
+	rows, err := repo.entClient.Client().Permission.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	idByCode := map[string]int64{}
+	for _, row := range rows {
+		idByCode[*row.Code] = row.ID
+	}
+
+	codes, err := repo.GetPermissionCodesByIDs(ctx, []int64{idByCode["sqlite_perm_lookup_a"], idByCode["sqlite_perm_lookup_b"]})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"sqlite_perm_lookup_a", "sqlite_perm_lookup_b"}, codes, "按 ID 列表应取回全部对应 code")
+
+	ids, err := repo.GetPermissionIDsByCodes(ctx, []string{"sqlite_perm_lookup_a"})
+	require.NoError(t, err)
+	require.Equal(t, []int64{idByCode["sqlite_perm_lookup_a"]}, ids, "按 code 列表应取回对应 ID")
+
+	emptyCodes, err := repo.GetPermissionCodesByIDs(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, emptyCodes, "空 ID 列表应返回空")
+}
+
+// TestPermissionRepoSqlite_Update 验证 Update 只更新掩码内字段（description），
+// 掩码外字段（name/code/status）保持原值。
+func TestPermissionRepoSqlite_Update(t *testing.T) {
+	entClient := enttest.NewEntClientForTest(t)
+	repo := newPermissionRepoSqlite(t, entClient)
+	ctx := enttest.NewSystemContext(context.Background())
+
+	require.NoError(t, repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name:        trans.Ptr("sqlite权限点-更新"),
+			Code:        trans.Ptr("sqlite_perm_update_code"),
+			Description: trans.Ptr("更新前描述"),
+		},
+	}))
+	rows, err := repo.entClient.Client().Permission.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	createdID := rows[0].ID
+
+	err = repo.Update(ctx, &permissionV1.UpdatePermissionRequest{
+		Id:         createdID,
+		UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"description"}},
+		Data: &permissionV1.Permission{
+			Description: trans.Ptr("更新后描述-sqlite"),
+		},
+	})
+	require.NoError(t, err, "更新 description 应成功")
+
+	after, err := repo.entClient.Client().Permission.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, after, 1)
+	require.Equal(t, "更新后描述-sqlite", *after[0].Description, "掩码内字段应被更新")
+	require.Equal(t, "sqlite权限点-更新", *after[0].Name, "掩码外字段 name 应保持原值")
+	require.Equal(t, "sqlite_perm_update_code", *after[0].Code, "掩码外字段 code 应保持原值")
+}
+
+// TestPermissionRepoSqlite_UpdateKeepsRelationGrants 是回归测试：编辑权限点曾把它自己的
+// 「菜单 / 接口授权」整片清空。原因是 UpdateOne 内部的 FilterByFieldMask 会把不在 mask 里的
+// Data 字段清零，而 api_ids / menu_ids 又被黑名单移出 mask —— Assign* 于是拿到空集，
+// 而它们的语义是「空集＝删光该权限的全部关联」。三端权限抽屉都带 menuIds/apiIds 提交，
+// 所以这条路径是「保存一次权限，丢光一次授权」。
+func TestPermissionRepoSqlite_UpdateKeepsRelationGrants(t *testing.T) {
+	// newApiRow 直建端点身份完整的 API 行并返回 id：绑定入参是 api 引用，
+	// 新键下落库前会解析成 (path, method) 快照——引用必须真实存在
+	newApiRow := func(t *testing.T, repo *PermissionRepo, ctx context.Context, path, method string) int64 {
+		t.Helper()
+		row, err := repo.entClient.Client().Api.Create().
+			SetNillablePath(trans.Ptr(path)).
+			SetNillableMethod(trans.Ptr(method)).
+			Save(ctx)
+		require.NoError(t, err, "直建 api 行应成功")
+		return row.ID
+	}
+
+	// newMenuRow 直建一条根菜单行（path 即全路径）并返回 id：菜单绑定入参同样是
+	// 菜单引用，落库前会解析成全路径快照——引用必须真实存在
+	newMenuRow := func(t *testing.T, repo *PermissionRepo, ctx context.Context, name, fullPath string) int64 {
+		t.Helper()
+		row, err := repo.entClient.Client().Menu.Create().
+			SetName(name).
+			SetPath(fullPath).
+			SetType(menu.TypeMenu).
+			Save(ctx)
+		require.NoError(t, err, "直建菜单行应成功")
+		return row.ID
+	}
+
+	newPerm := func(t *testing.T, code string) (*PermissionRepo, context.Context, int64, int64, int64, int64, int64, int64) {
+		t.Helper()
+		entClient := enttest.NewEntClientForTest(t)
+		repo := newPermissionRepoSqlite(t, entClient)
+		ctx := enttest.NewSystemContext(context.Background())
+		apiA := newApiRow(t, repo, ctx, "/sqlite/rel/a", "GET")
+		apiB := newApiRow(t, repo, ctx, "/sqlite/rel/b", "POST")
+		menu1 := newMenuRow(t, repo, ctx, "RelMenu1", "/relm/one")
+		menu2 := newMenuRow(t, repo, ctx, "RelMenu2", "/relm/two")
+		menu3 := newMenuRow(t, repo, ctx, "RelMenu3", "/relm/three")
+		require.NoError(t, repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+			Data: &permissionV1.Permission{
+				Name:    trans.Ptr("sqlite权限点-关联保持"),
+				Code:    trans.Ptr(code),
+				MenuIds: []int64{menu1, menu2, menu3},
+				ApiIds:  []int64{apiA, apiB},
+			},
+		}))
+		rows, err := repo.entClient.Client().Permission.Query().All(ctx)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		return repo, ctx, rows[0].ID, apiA, apiB, menu1, menu2, menu3
+	}
+
+	menuPaths := func(t *testing.T, repo *PermissionRepo, ctx context.Context, permID int64) map[string]struct{} {
+		t.Helper()
+		links, err := repo.entClient.Client().PermissionMenu.Query().
+			Where(permissionmenu.PermissionIDEQ(permID)).All(ctx)
+		require.NoError(t, err)
+		paths := make(map[string]struct{}, len(links))
+		for _, l := range links {
+			require.NotNil(t, l.FullPath, "关联行的 full_path 快照不应为 NULL")
+			paths[*l.FullPath] = struct{}{}
+		}
+		return paths
+	}
+
+	t.Run("掩码带关联字段（三端权限抽屉的形状）应落新集", func(t *testing.T) {
+		repo, ctx, id, _, old, m1, m2, m3 := newPerm(t, "sqlite_perm_rel_mask")
+		apiC := newApiRow(t, repo, ctx, "/sqlite/rel/c", "PUT")
+		newMenuA := newMenuRow(t, repo, ctx, "RelMenuA", "/relm/a")
+		newMenuB := newMenuRow(t, repo, ctx, "RelMenuB", "/relm/b")
+		newMenuC := newMenuRow(t, repo, ctx, "RelMenuC", "/relm/c")
+		require.NoError(t, repo.Update(ctx, &permissionV1.UpdatePermissionRequest{
+			Id:         id,
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"name", "menu_ids", "api_ids"}},
+			Data: &permissionV1.Permission{
+				Name:    trans.Ptr("sqlite权限点-关联改写"),
+				MenuIds: []int64{newMenuA, newMenuB, newMenuC},
+				ApiIds:  []int64{apiC},
+			},
+		}))
+		paths := menuPaths(t, repo, ctx, id)
+		require.Len(t, paths, 3, "提交的菜单集应整体替换旧的")
+		require.Contains(t, paths, "/relm/a", "绑定应落新菜单的全路径快照")
+		require.NotContains(t, paths, "/relm/one", "旧菜单集应被清掉")
+		require.NotEqual(t, m1, newMenuA)
+		require.NotEqual(t, m2, newMenuB)
+		require.NotEqual(t, m3, newMenuC)
+		endpoints, err := repo.permissionApiRepo.ListEndpoints(ctx, []int64{id})
+		require.NoError(t, err)
+		require.Len(t, endpoints, 1, "提交的接口集应整体替换旧的")
+		require.Equal(t, "/sqlite/rel/c", endpoints[0].Path, "绑定应落新端点的快照")
+		require.NotEqual(t, old, apiC)
+	})
+
+	t.Run("掩码不含关联字段（只改名）不得动授权", func(t *testing.T) {
+		repo, ctx, id, _, _, _, _, _ := newPerm(t, "sqlite_perm_rel_rename")
+		require.NoError(t, repo.Update(ctx, &permissionV1.UpdatePermissionRequest{
+			Id:         id,
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"name"}},
+			Data:       &permissionV1.Permission{Name: trans.Ptr("sqlite权限点-仅改名")},
+		}))
+		paths := menuPaths(t, repo, ctx, id)
+		require.Len(t, paths, 3, "没提交 menu_ids 就该维持原授权")
+		require.Contains(t, paths, "/relm/one")
+		require.Contains(t, paths, "/relm/two")
+		require.Contains(t, paths, "/relm/three")
+	})
+
+	t.Run("camelCase 掩码路径同样受保护", func(t *testing.T) {
+		// protojson 会把 json_name 规范成 snake_case，但直连 gRPC/测试的调用方给什么就是什么，
+		// 两种拼写都得认出，否则同样的清空只在 HTTP 侧消失。
+		repo, ctx, id, _, _, _, _, _ := newPerm(t, "sqlite_perm_rel_camel")
+		apiD := newApiRow(t, repo, ctx, "/sqlite/rel/d", "PATCH")
+		apiE := newApiRow(t, repo, ctx, "/sqlite/rel/e", "DELETE")
+		newMenuD := newMenuRow(t, repo, ctx, "RelMenuD", "/relm/d")
+		require.NoError(t, repo.Update(ctx, &permissionV1.UpdatePermissionRequest{
+			Id:         id,
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"menuIds", "apiIds"}},
+			Data: &permissionV1.Permission{
+				MenuIds: []int64{newMenuD},
+				ApiIds:  []int64{apiD, apiE},
+			},
+		}))
+		paths := menuPaths(t, repo, ctx, id)
+		require.Len(t, paths, 1, "camelCase 掩码路径的菜单集替换应同样生效")
+		require.Contains(t, paths, "/relm/d")
+		endpoints, err := repo.permissionApiRepo.ListEndpoints(ctx, []int64{id})
+		require.NoError(t, err)
+		require.Len(t, endpoints, 2, "camelCase 掩码路径的接口集替换应同样生效")
+	})
+
+	t.Run("显式提交空集仍是清空", func(t *testing.T) {
+		repo, ctx, id, _, _, _, _, _ := newPerm(t, "sqlite_perm_rel_clear")
+		require.NoError(t, repo.Update(ctx, &permissionV1.UpdatePermissionRequest{
+			Id:         id,
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"menu_ids", "api_ids"}},
+			Data: &permissionV1.Permission{
+				Name:    trans.Ptr("sqlite权限点-清空授权"),
+				MenuIds: []int64{},
+				ApiIds:  []int64{},
+			},
+		}))
+		require.Empty(t, menuPaths(t, repo, ctx, id), "全不勾是合法操作：提交了就该清空")
+	})
+}
+
+// TestPermissionRepoSqlite_Delete 验证按 ID 与按 code 删除后行数归零。
+func TestPermissionRepoSqlite_Delete(t *testing.T) {
+	entClient := enttest.NewEntClientForTest(t)
+	repo := newPermissionRepoSqlite(t, entClient)
+	ctx := enttest.NewSystemContext(context.Background())
+
+	// 按 ID 删除
+	require.NoError(t, repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name: trans.Ptr("待删除-按ID"),
+			Code: trans.Ptr("sqlite_perm_del_by_id"),
+		},
+	}))
+	rows, err := repo.entClient.Client().Permission.Query().All(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.NoError(t, repo.Delete(ctx, &permissionV1.DeletePermissionRequest{
+		QueryBy: &permissionV1.DeletePermissionRequest_Id{Id: rows[0].ID},
+	}), "按 ID 删除应成功")
+	cnt, err := repo.entClient.Client().Permission.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, cnt, "按 ID 删除后表内行数应为 0")
+
+	// 按 code 删除
+	require.NoError(t, repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name: trans.Ptr("待删除-按code"),
+			Code: trans.Ptr("sqlite_perm_del_by_code"),
+		},
+	}))
+	require.NoError(t, repo.Delete(ctx, &permissionV1.DeletePermissionRequest{
+		QueryBy: &permissionV1.DeletePermissionRequest_Code{Code: "sqlite_perm_del_by_code"},
+	}), "按 code 删除应成功")
+	cnt, err = repo.entClient.Client().Permission.Query().Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, cnt, "按 code 删除后表内行数应为 0")
+}
+
+// TestPermissionRepoSqlite_DeleteCascadesAllBindings 权限行删除的全链级联回归：
+// 角色授权（sys_role_permissions）、端点快照（sys_permission_apis）、菜单快照
+// （sys_permission_menus）、策略联动行（sys_permission_policies）随行同删，
+// 授权链上不留指向已删权限行的悬空绑定；按 ID / 按 code / DeleteByIDs 三个
+// 入口同一语义。
+func TestPermissionRepoSqlite_DeleteCascadesAllBindings(t *testing.T) {
+	entClient := enttest.NewEntClientForTest(t)
+	repo := newPermissionRepoSqlite(t, entClient)
+	ctx := enttest.NewSystemContext(context.Background())
+	client := repo.entClient.Client()
+
+	require.NoError(t, repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name: trans.Ptr("级联删除权限甲"),
+			Code: trans.Ptr("sqlite_perm_cascade_a"),
+		},
+	}))
+	require.NoError(t, repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name: trans.Ptr("级联删除权限乙"),
+			Code: trans.Ptr("sqlite_perm_cascade_b"),
+		},
+	}))
+	permA, err := client.Permission.Query().Where(permission.CodeEQ("sqlite_perm_cascade_a")).Only(ctx)
+	require.NoError(t, err)
+	permB, err := client.Permission.Query().Where(permission.CodeEQ("sqlite_perm_cascade_b")).Only(ctx)
+	require.NoError(t, err)
+
+	roleRow, err := client.Role.Create().
+		SetName("级联删除角色").
+		SetCode("CASCADE_DEL_ROLE").
+		SetNillableTenantID(trans.Ptr(int64(42))).
+		Save(ctx)
+	require.NoError(t, err)
+	require.NoError(t, client.RolePermission.Create().
+		SetRoleID(roleRow.ID).SetTenantID(42).SetPermissionID(permA.ID).
+		Exec(ctx), "直建角色授权应成功")
+	require.NoError(t, client.PermissionApi.Create().
+		SetPermissionID(permA.ID).SetPath("/cascade/a").SetMethod("GET").
+		Exec(ctx), "直建端点快照绑定应成功")
+	require.NoError(t, client.PermissionMenu.Create().
+		SetPermissionID(permA.ID).SetFullPath("/cascade-a").
+		Exec(ctx), "直建菜单快照绑定应成功")
+	require.NoError(t, client.PermissionPolicy.Create().
+		SetPermissionID(permA.ID).SetEvalOrder(1).
+		Exec(ctx), "直建策略联动行应成功")
+	// 权限乙只挂角色授权（删除甲不得牵连乙的绑定）
+	require.NoError(t, client.RolePermission.Create().
+		SetRoleID(roleRow.ID).SetTenantID(42).SetPermissionID(permB.ID).
+		Exec(ctx), "直建乙的角色授权应成功")
+
+	// 按 ID 删除甲 → 四类从属绑定全部级联清掉
+	require.NoError(t, repo.Delete(ctx, &permissionV1.DeletePermissionRequest{
+		QueryBy: &permissionV1.DeletePermissionRequest_Id{Id: permA.ID},
+	}), "按 ID 删除甲应成功")
+
+	rpCnt, err := client.RolePermission.Query().Where(rolepermission.PermissionIDEQ(permA.ID)).Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, rpCnt, "角色授权必须级联清理")
+	paCnt, err := client.PermissionApi.Query().Where(permissionapi.PermissionIDEQ(permA.ID)).Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, paCnt, "端点快照绑定必须级联清理")
+	pmCnt, err := client.PermissionMenu.Query().Where(permissionmenu.PermissionIDEQ(permA.ID)).Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, pmCnt, "菜单快照绑定必须级联清理")
+	ppCnt, err := client.PermissionPolicy.Query().Where(permissionpolicy.PermissionIDEQ(permA.ID)).Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, ppCnt, "策略联动行必须级联清理")
+
+	bCnt, err := client.RolePermission.Query().Where(rolepermission.PermissionIDEQ(permB.ID)).Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, bCnt, "删除甲不得牵连权限乙的绑定")
+
+	// DeleteByIDs 删除乙 → 同样的级联语义
+	require.NoError(t, repo.DeleteByIDs(ctx, []int64{permB.ID}), "DeleteByIDs 应成功")
+	rpCnt, err = client.RolePermission.Query().Where(rolepermission.PermissionIDEQ(permB.ID)).Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, rpCnt, "DeleteByIDs 同样必须级联清角色授权")
+
+	// 按 code 建丙 → 按 code 删除 → 级联同样生效
+	require.NoError(t, repo.Create(ctx, &permissionV1.CreatePermissionRequest{
+		Data: &permissionV1.Permission{
+			Name: trans.Ptr("级联删除权限丙"),
+			Code: trans.Ptr("sqlite_perm_cascade_c"),
+		},
+	}))
+	permC, err := client.Permission.Query().Where(permission.CodeEQ("sqlite_perm_cascade_c")).Only(ctx)
+	require.NoError(t, err)
+	require.NoError(t, client.PermissionMenu.Create().
+		SetPermissionID(permC.ID).SetFullPath("/cascade-c").
+		Exec(ctx), "直建丙的菜单快照绑定应成功")
+	require.NoError(t, repo.Delete(ctx, &permissionV1.DeletePermissionRequest{
+		QueryBy: &permissionV1.DeletePermissionRequest_Code{Code: "sqlite_perm_cascade_c"},
+	}), "按 code 删除丙应成功")
+	pmCnt, err = client.PermissionMenu.Query().Where(permissionmenu.PermissionIDEQ(permC.ID)).Count(ctx)
+	require.NoError(t, err)
+	require.Zero(t, pmCnt, "按 code 删除同样必须级联清菜单快照绑定")
+}

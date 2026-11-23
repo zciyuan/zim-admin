@@ -1,0 +1,275 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	bLogger "github.com/tx7do/kratos-bootstrap/logger"
+
+	paginationV1 "github.com/tx7do/go-crud/api/gen/go/pagination/v1"
+	"github.com/tx7do/go-utils/sliceutil"
+	"github.com/tx7do/go-utils/trans"
+	"github.com/tx7do/kratos-bootstrap/bootstrap"
+	"google.golang.org/protobuf/types/known/emptypb"
+
+	"go-wind-admin/app/admin/service/internal/data"
+
+	adminV1 "go-wind-admin/api/gen/go/admin/service/v1"
+	identityV1 "go-wind-admin/api/gen/go/identity/service/v1"
+	permissionV1 "go-wind-admin/api/gen/go/permission/service/v1"
+
+	"go-wind-admin/pkg/middleware/auth"
+)
+
+type AdminPortalService struct {
+	adminV1.AdminPortalServiceHTTPServer
+
+	log *bLogger.Helper
+
+	menuRepo       *data.MenuRepo
+	roleRepo       *data.RoleRepo
+	userRepo       data.UserRepo
+	permissionRepo *data.PermissionRepo
+	planModuleRepo *data.PlanModuleRepo
+	tenantRepo     *data.TenantRepo
+}
+
+func NewAdminPortalService(
+	ctx *bootstrap.Context,
+	menuRepo *data.MenuRepo,
+	roleRepo *data.RoleRepo,
+	userRepo data.UserRepo,
+	permissionRepo *data.PermissionRepo,
+	planModuleRepo *data.PlanModuleRepo,
+	tenantRepo *data.TenantRepo,
+) *AdminPortalService {
+	return &AdminPortalService{
+		log:            ctx.NewLoggerHelper("admin-portal/service/admin-service"),
+		menuRepo:       menuRepo,
+		roleRepo:       roleRepo,
+		userRepo:       userRepo,
+		permissionRepo: permissionRepo,
+		planModuleRepo: planModuleRepo,
+		tenantRepo:     tenantRepo,
+	}
+}
+
+func (s *AdminPortalService) menuListToQueryString(menus []int64, onlyButton bool) string {
+	var ids []string
+	for _, menu := range menus {
+		ids = append(ids, fmt.Sprintf("\"%d\"", menu))
+	}
+	idsStr := fmt.Sprintf("[%s]", strings.Join(ids, ", "))
+	query := map[string]string{"id__in": idsStr}
+
+	if onlyButton {
+		query["type"] = permissionV1.Menu_BUTTON.String()
+	} else {
+		query["type__not"] = permissionV1.Menu_BUTTON.String()
+	}
+
+	query["status"] = "ON"
+
+	queryStr, err := json.Marshal(query)
+	if err != nil {
+		return ""
+	}
+
+	return string(queryStr)
+}
+
+// queryMultipleRolesMenusByRoleCodes 使用RoleCodes查询菜单，即多个角色的菜单。
+// 菜单授权绑定存全路径快照（菜单身份键，免疫菜单重建换 id），这里把多角色的
+// 绑定快照反解回当前菜单 id 再走原有的 id__in 菜单查询。
+func (s *AdminPortalService) queryMultipleRolesMenusByRoleCodes(ctx context.Context, roleIDs []int64) ([]int64, error) {
+	paths, err := s.roleRepo.GetRolesPermissionMenuFullPaths(ctx, roleIDs)
+	if err != nil {
+		return nil, adminV1.ErrorInternalServerError("query roles menu full paths failed")
+	}
+
+	s.log.Infof(ctx, "queryMultipleRolesMenusByRoleCodes menuPaths: %+v", paths)
+
+	menuIDs, err := s.menuRepo.ResolveMenuIDsByFullPaths(ctx, paths)
+	if err != nil {
+		return nil, err
+	}
+
+	menuIDs = sliceutil.Unique(menuIDs)
+
+	return menuIDs, nil
+}
+func (s *AdminPortalService) GetMyPermissionCode(ctx context.Context, _ *emptypb.Empty) (*adminV1.ListPermissionCodeResponse, error) {
+	// 获取操作人信息
+	operator, err := auth.FromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	user, err := s.userRepo.Get(ctx, &identityV1.GetUserRequest{
+		QueryBy: &identityV1.GetUserRequest_Id{
+			Id: operator.UserId,
+		},
+	})
+	if err != nil {
+		s.log.Errorf(ctx, "query user failed[%s]", err.Error())
+		return nil, adminV1.ErrorInternalServerError("query user failed")
+	}
+
+	permissionIDs, err := s.roleRepo.ListPermissionIDsByRoleIDs(ctx, user.GetRoleIds())
+	if err != nil {
+		return nil, err
+	}
+
+	var permissionCodes []string
+	permissionCodes, err = s.permissionRepo.GetPermissionCodesByIDs(ctx, permissionIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	return &adminV1.ListPermissionCodeResponse{
+		Codes:        permissionCodes,
+		HiddenFields: operator.GetHiddenFields(),
+	}, nil
+}
+
+func (s *AdminPortalService) fillRouteItem(menus []*permissionV1.Menu) []*permissionV1.MenuRouteItem {
+	if len(menus) == 0 {
+		return nil
+	}
+
+	var routers []*permissionV1.MenuRouteItem
+
+	for _, v := range menus {
+		if v.GetStatus() != permissionV1.Menu_ON {
+			continue
+		}
+		if v.GetType() == permissionV1.Menu_BUTTON {
+			continue
+		}
+
+		item := &permissionV1.MenuRouteItem{
+			Path:      v.Path,
+			Component: v.Component,
+			Name:      v.Name,
+			Redirect:  v.Redirect,
+			Alias:     v.Alias,
+			Meta:      v.Meta,
+		}
+
+		if len(v.Children) > 0 {
+			item.Children = s.fillRouteItem(v.Children)
+		}
+
+		routers = append(routers, item)
+	}
+
+	return routers
+}
+
+func (s *AdminPortalService) GetNavigation(ctx context.Context, _ *emptypb.Empty) (*adminV1.ListRouteResponse, error) {
+	// 获取操作人信息
+	operator, err := auth.FromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	user, err := s.userRepo.Get(ctx, &identityV1.GetUserRequest{
+		QueryBy: &identityV1.GetUserRequest_Id{
+			Id: operator.UserId,
+		},
+	})
+	if err != nil {
+		s.log.Errorf(ctx, "query user failed[%s]", err.Error())
+		return nil, adminV1.ErrorInternalServerError("query user failed")
+	}
+
+	// 多角色的菜单
+	roleMenus, err := s.queryMultipleRolesMenusByRoleCodes(ctx, user.GetRoleIds())
+	if err != nil {
+		return nil, err
+	}
+
+	menuList, err := s.menuRepo.List(ctx, &paginationV1.PagingRequest{
+		NoPaging: trans.Ptr(true),
+		FilteringType: &paginationV1.PagingRequest_Query{
+			Query: s.menuListToQueryString(roleMenus, false),
+		},
+	}, true)
+	if err != nil {
+		s.log.Errorf(ctx, "list route failed [%s]", err.Error())
+		return nil, adminV1.ErrorInternalServerError("list route failed")
+	}
+
+	// 套餐模块白名单过滤：仅对租户用户（tenantId>0）生效。
+	// 平台管理员（tenantId=0）不过滤，看到全部授权菜单。
+	tid := operator.GetTenantId()
+	if tid > 0 {
+		menuList.Items = s.filterMenusByPlanWhitelist(ctx, menuList.Items, tid)
+	}
+
+	return &adminV1.ListRouteResponse{Items: s.fillRouteItem(menuList.Items)}, nil
+}
+
+// filterMenusByPlanWhitelist 按当前租户订阅套餐的模块白名单过滤菜单。
+// 递归过滤整棵树：module 不在白名单内的节点（含其子树）剔除，未归类（nil）
+// 一律放行；容器在全部子项被剔除后一并丢弃，不留空目录。
+func (s *AdminPortalService) filterMenusByPlanWhitelist(ctx context.Context, items []*permissionV1.Menu, tenantId int64) []*permissionV1.Menu {
+	// 查租户的 plan_id
+	t, err := s.tenantRepo.Get(ctx, &identityV1.GetTenantRequest{
+		QueryBy: &identityV1.GetTenantRequest_Id{
+			Id: tenantId,
+		},
+	})
+	if err != nil || t == nil || t.PlanId == nil || *t.PlanId == 0 {
+		// 无套餐或查询失败 → 清空菜单（租户无任何模块权限）
+		return nil
+	}
+	planId := *t.PlanId
+
+	// 查该套餐的白名单模块集合
+	allowed, err := s.planModuleRepo.ListModulesByPlanId(ctx, planId)
+	if err != nil || len(allowed) == 0 {
+		return nil
+	}
+
+	filtered := make([]*permissionV1.Menu, 0, len(items))
+	for _, m := range items {
+		if kept := filterMenuTree(m, allowed); kept != nil {
+			filtered = append(filtered, kept)
+		}
+	}
+	return filtered
+}
+
+// filterMenuTree 递归按白名单过滤菜单树，返回 nil 表示整枝剔除。
+// module 非空且不在白名单内 → 剔除；未归类（nil）→ 放行（与种子口径一致：
+// 通知等平台页刻意不登记 module，不参与套餐过滤）。
+// 容器（无 module）在子项全被剔除时一并丢弃——侧边栏不留空目录。
+//
+// 历史缺陷（notification_domain_design.md §4 欠账 2 后半）：这里曾只遍历
+// 顶层平铺 for，而 sys_menus 的根节点一条都不带 module、带 module 的全是
+// 叶子，白名单实际过滤面为 0；接上递归后叶子才真正按套餐判定。
+func filterMenuTree(m *permissionV1.Menu, allowed map[identityV1.Module]bool) *permissionV1.Menu {
+	if m == nil {
+		return nil
+	}
+	if m.Module != nil && !allowed[*m.Module] {
+		return nil
+	}
+	if len(m.Children) == 0 {
+		return m
+	}
+	kept := make([]*permissionV1.Menu, 0, len(m.Children))
+	for _, c := range m.Children {
+		if k := filterMenuTree(c, allowed); k != nil {
+			kept = append(kept, k)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	m.Children = kept
+	return m
+}

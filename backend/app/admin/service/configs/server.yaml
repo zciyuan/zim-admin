@@ -1,0 +1,63 @@
+server:
+  rest:
+    addr: ":7788"
+    timeout: 10s
+    # P2 修复：默认关闭——Swagger 向未认证者暴露全量 API 面（侦察成本极低），
+    # pprof 路由不经任何中间件（无 auth/recovery/限流，内存快照/goroutine 栈
+    # 即信息泄露，profile 可被用作 CPU DoS）。本地调试按需改回 true。
+    enable_swagger: false
+    enable_pprof: false
+    cors:
+      # 前端 refresh token 走 HttpOnly Cookie（withCredentials=true），
+      # 预检响应必须带 Access-Control-Allow-Credentials: true
+      allow_credentials: true
+      headers:
+        - "X-Requested-With"
+        - "X-Request-ID"
+        - "Content-Type"
+        - "Authorization"
+        - "X-Captcha-Id"
+        - "X-Captcha-Value"
+      methods:
+        - "GET"
+        - "POST"
+        - "PUT"
+        - "DELETE"
+        - "HEAD"
+        - "OPTIONS"
+      origins:
+        # 前端三套域名（与 README 演示地址一致）
+        - "https://vben.admin.gowind.cloud"
+        - "https://ele.admin.gowind.cloud"
+        - "https://react.admin.gowind.cloud"
+        # 本地开发端口（与 README 启动命令一致；15xxx 段避开姐妹仓默认占用的 5xxx 段）
+        - "http://localhost:15666"
+        - "http://localhost:15777"
+        - "http://localhost:15888"
+    middleware:
+      enable_logging: true
+      enable_recovery: true
+      enable_tracing: true
+      enable_validate: true
+      enable_circuit_breaker: true
+      enable_metadata: true
+
+  asynq:
+    uri: "redis://:*Abcd123456@redis:6379/1"
+    codec: "json"
+    concurrency: 10
+    shutdown_timeout: 10s
+    enable_gracefully_shutdown: false
+    enable_strict_priority: true
+    location: "Asia/Shanghai"
+    queues:
+      critical: 10
+      default: 5
+      low: 1
+
+  sse:
+    addr: ":7789"
+    codec: "json"
+    path: "/events"
+    auto_stream: true
+    auto_reply: false

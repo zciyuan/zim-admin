@@ -1,0 +1,457 @@
+//go:build gorm_backend
+// +build gorm_backend
+
+// Package gorm 中的仓储是 ent 仓储的平行 gorm 镜像，作为"ent 为主力、gorm 为备选"脚手架的完整代码。
+// 这些仓储仅由 cmd/server/wiring_gorm.go(gorm_backend 构建,ORM 切换 Phase 4 占位)装配,服务层尚未接入。
+//
+// gorm 仓储不做租户隔离（ent 侧靠编译进生成代码的 privacy 策略自动注入，gorm 侧无此机制）。
+// 直接切换 gorm 后端会有跨租户数据泄露风险，采用者须自行加 scope/plugin。
+package gorm
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	gormDB "gorm.io/gorm"
+
+	"github.com/tx7do/kratos-bootstrap/bootstrap"
+	bLogger "github.com/tx7do/kratos-bootstrap/logger"
+
+	paginationV1 "github.com/tx7do/go-crud/api/gen/go/pagination/v1"
+	gormCrud "github.com/tx7do/go-crud/gorm"
+	gormCrudFilter "github.com/tx7do/go-crud/gorm/filter"
+	paginationFilter "github.com/tx7do/go-crud/pagination/filter"
+
+	"github.com/tx7do/go-utils/copierutil"
+	"github.com/tx7do/go-utils/mapper"
+	"github.com/tx7do/go-utils/trans"
+
+	"go-wind-admin/app/admin/service/internal/data/gorm/models"
+
+	identityV1 "go-wind-admin/api/gen/go/identity/service/v1"
+	permissionV1 "go-wind-admin/api/gen/go/permission/service/v1"
+)
+
+type ApiRepo struct {
+	client           *gormCrud.Client
+	log              *bLogger.Helper
+	mapper           *mapper.CopierMapper[permissionV1.Api, models.Api]
+	repository       *gormCrud.Repository[permissionV1.Api, models.Api]
+	structuredFilter *gormCrudFilter.StructuredFilter
+
+	// permissionApi 绑定 repo：接口同步/删除按 (path, method) 级联清理绑定
+	// 快照用，与 data 栈同构。
+	permissionApi *PermissionApiRepo
+
+	scopeConverter          *mapper.EnumTypeConverter[permissionV1.Api_Scope, string]
+	businessModuleConverter *mapper.EnumTypeConverter[identityV1.Module, string]
+}
+
+func NewApiRepo(
+	ctx *bootstrap.Context,
+	client *gormCrud.Client,
+	permissionApi *PermissionApiRepo,
+) *ApiRepo {
+	repo := &ApiRepo{
+		log:              ctx.NewLoggerHelper("api/gorm-repo/admin-service"),
+		client:           client,
+		mapper:           mapper.NewCopierMapper[permissionV1.Api, models.Api](),
+		structuredFilter: gormCrudFilter.NewStructuredFilter(),
+		permissionApi:    permissionApi,
+
+		scopeConverter:          mapper.NewEnumTypeConverter[permissionV1.Api_Scope, string](permissionV1.Api_Scope_name, permissionV1.Api_Scope_value),
+		businessModuleConverter: mapper.NewEnumTypeConverter[identityV1.Module, string](identityV1.Module_name, identityV1.Module_value),
+	}
+
+	repo.init()
+
+	return repo
+}
+
+func (r *ApiRepo) init() {
+	r.repository = gormCrud.NewRepository[permissionV1.Api, models.Api](r.mapper)
+
+	r.mapper.AppendConverters(copierutil.NewTimeStringConverterPair())
+	r.mapper.AppendConverters(copierutil.NewTimeTimestamppbConverterPair())
+
+	r.mapper.AppendConverters(r.scopeConverter.NewConverterPair())
+	r.mapper.AppendConverters(r.businessModuleConverter.NewConverterPair())
+}
+
+func (r *ApiRepo) Count(ctx context.Context, req *paginationV1.PagingRequest) (*permissionV1.CountApiResponse, error) {
+	if req == nil {
+		return nil, permissionV1.ErrorBadRequest("invalid parameter")
+	}
+
+	filterExpr, err := paginationFilter.ConvertFilterByPagingRequest(req)
+	if err != nil {
+		r.log.Errorf(ctx, "convert filter failed: %s", err.Error())
+		return nil, permissionV1.ErrorInternalServerError("query api count failed")
+	}
+
+	scopes, err := r.structuredFilter.BuildSelectors(filterExpr)
+	if err != nil {
+		r.log.Errorf(ctx, "build selectors failed: %s", err.Error())
+		return nil, permissionV1.ErrorInternalServerError("query api count failed")
+	}
+
+	count, err := r.repository.Count(ctx, r.client.DB, scopes)
+	if err != nil {
+		r.log.Errorf(ctx, "query api count failed: %s", err.Error())
+		return nil, permissionV1.ErrorInternalServerError("query api count failed")
+	}
+
+	return &permissionV1.CountApiResponse{
+		Count: int64(count),
+	}, nil
+}
+
+func (r *ApiRepo) List(ctx context.Context, req *paginationV1.PagingRequest) (*permissionV1.ListApiResponse, error) {
+	if req == nil {
+		return nil, permissionV1.ErrorBadRequest("invalid parameter")
+	}
+
+	ret, err := r.repository.ListWithPaging(ctx, r.client.DB, req)
+	if err != nil {
+		return nil, permissionV1.ErrorInternalServerError("query list failed")
+	}
+	if ret == nil {
+		return &permissionV1.ListApiResponse{Total: 0, Items: nil}, nil
+	}
+
+	return &permissionV1.ListApiResponse{
+		Total: ret.Total,
+		Items: ret.Items,
+	}, nil
+}
+
+func (r *ApiRepo) IsExist(ctx context.Context, id int64) (bool, error) {
+	exist, err := r.repository.ExistsWithFilters(ctx, r.client.DB, []func(*gormDB.DB) *gormDB.DB{
+		func(db *gormDB.DB) *gormDB.DB { return db.Where("id = ?", id) },
+	})
+	if err != nil {
+		r.log.Errorf(ctx, "query exist failed: %s", err.Error())
+		return false, permissionV1.ErrorInternalServerError("query exist failed")
+	}
+	return exist, nil
+}
+
+func (r *ApiRepo) Get(ctx context.Context, req *permissionV1.GetApiRequest) (*permissionV1.Api, error) {
+	if req == nil {
+		return nil, permissionV1.ErrorBadRequest("invalid parameter")
+	}
+
+	var scopes []func(*gormDB.DB) *gormDB.DB
+	switch req.QueryBy.(type) {
+	default:
+	case *permissionV1.GetApiRequest_Id:
+		scopes = append(scopes, func(db *gormDB.DB) *gormDB.DB { return db.Where("id = ?", req.GetId()) })
+	}
+
+	dto, err := r.repository.GetWithFilters(ctx, r.client.DB, scopes, req.GetViewMask())
+	if err != nil {
+		if errors.Is(err, gormDB.ErrRecordNotFound) {
+			return nil, permissionV1.ErrorNotFound("api not found")
+		}
+		r.log.Errorf(ctx, "query api failed: %s", err.Error())
+		return nil, permissionV1.ErrorInternalServerError("query api failed")
+	}
+
+	return dto, nil
+}
+
+// GetApiByEndpoint 根据路径和方法获取API资源
+func (r *ApiRepo) GetApiByEndpoint(ctx context.Context, path, method string) (*permissionV1.Api, error) {
+	if path == "" || method == "" {
+		return nil, permissionV1.ErrorBadRequest("invalid parameter")
+	}
+
+	var entity models.Api
+	if err := r.client.DB.WithContext(ctx).Model(&models.Api{}).Where("path = ? AND method = ?", path, method).First(&entity).Error; err != nil {
+		if errors.Is(err, gormDB.ErrRecordNotFound) {
+			return nil, permissionV1.ErrorNotFound("api not found")
+		}
+		r.log.Errorf(ctx, "query data failed: %s", err.Error())
+		return nil, permissionV1.ErrorInternalServerError("query data failed")
+	}
+
+	return r.mapper.ToDTO(&entity), nil
+}
+
+// GetApiByIDs 根据ID列表获取API资源
+func (r *ApiRepo) GetApiByIDs(ctx context.Context, ids []int64) ([]*permissionV1.Api, error) {
+	if len(ids) == 0 {
+		return nil, permissionV1.ErrorBadRequest("invalid parameter")
+	}
+
+	var entities []*models.Api
+	if err := r.client.DB.WithContext(ctx).Model(&models.Api{}).Where("id IN ?", ids).Find(&entities).Error; err != nil {
+		r.log.Errorf(ctx, "query data failed: %s", err.Error())
+		return nil, permissionV1.ErrorInternalServerError("query data failed")
+	}
+
+	dtos := make([]*permissionV1.Api, 0, len(entities))
+	for _, entity := range entities {
+		dtos = append(dtos, r.mapper.ToDTO(entity))
+	}
+
+	return dtos, nil
+}
+
+func (r *ApiRepo) Create(ctx context.Context, req *permissionV1.CreateApiRequest) error {
+	if req == nil || req.Data == nil {
+		return permissionV1.ErrorBadRequest("invalid parameter")
+	}
+
+	if _, err := r.repository.Create(ctx, r.client.DB, req.Data, nil); err != nil {
+		r.log.Errorf(ctx, "insert api failed: %s", err.Error())
+		return permissionV1.ErrorInternalServerError("insert api failed")
+	}
+
+	return nil
+}
+
+func (r *ApiRepo) BatchCreate(ctx context.Context, apis []*permissionV1.Api) error {
+	if len(apis) == 0 {
+		return nil
+	}
+
+	if _, err := r.repository.BatchCreate(ctx, r.client.DB, apis, nil); err != nil {
+		r.log.Errorf(ctx, "batch insert apis failed: %s", err.Error())
+		return permissionV1.ErrorInternalServerError("batch insert apis failed")
+	}
+
+	return nil
+}
+
+func (r *ApiRepo) Update(ctx context.Context, req *permissionV1.UpdateApiRequest) error {
+	if req == nil || req.Data == nil {
+		return permissionV1.ErrorBadRequest("invalid parameter")
+	}
+	if req.GetId() == 0 {
+		return permissionV1.ErrorBadRequest("id is required")
+	}
+
+	// 如果不存在则创建
+	if req.GetAllowMissing() {
+		exist, err := r.IsExist(ctx, req.GetId())
+		if err != nil {
+			return err
+		}
+		if !exist {
+			createReq := &permissionV1.CreateApiRequest{Data: req.Data}
+			createReq.Data.CreatedBy = createReq.Data.UpdatedBy
+			createReq.Data.UpdatedBy = nil
+			return r.Create(ctx, createReq)
+		}
+	}
+
+	// (path, method) 是 API 的身份键（权限绑定快照/租户闸门/authorizer 策略都
+	// 以它为裁决键），不接受改身份：要变更 = 删旧建新（或走接口同步 MERGE）。
+	// 与 data 栈同口径。
+	var existing models.Api
+	if err := r.client.DB.WithContext(ctx).Model(&models.Api{}).
+		Where("id = ?", req.GetId()).First(&existing).Error; err != nil {
+		if errors.Is(err, gormDB.ErrRecordNotFound) {
+			return permissionV1.ErrorNotFound("api not found")
+		}
+		r.log.Errorf(ctx, "query api for identity guard failed: %s", err.Error())
+		return permissionV1.ErrorInternalServerError("query api failed")
+	}
+	if req.Data.Path != nil && existing.Path != nil && *req.Data.Path != *existing.Path {
+		return permissionV1.ErrorBadRequest("api path is immutable: delete and recreate instead")
+	}
+	if req.Data.Method != nil && existing.Method != nil && *req.Data.Method != *existing.Method {
+		return permissionV1.ErrorBadRequest("api method is immutable: delete and recreate instead")
+	}
+
+	if _, err := r.repository.UpdateWithFilters(ctx, r.client.DB, []func(*gormDB.DB) *gormDB.DB{
+		func(db *gormDB.DB) *gormDB.DB { return db.Where("id = ?", req.GetId()) },
+	}, req.Data, req.GetUpdateMask()); err != nil {
+		r.log.Errorf(ctx, "update api failed: %s", err.Error())
+		return permissionV1.ErrorInternalServerError("update api failed")
+	}
+
+	return nil
+}
+
+func (r *ApiRepo) Delete(ctx context.Context, req *permissionV1.DeleteApiRequest) error {
+	if req == nil {
+		return permissionV1.ErrorBadRequest("invalid parameter")
+	}
+
+	if _, err := r.repository.DeleteWithFilters(ctx, r.client.DB, []func(*gormDB.DB) *gormDB.DB{
+		func(db *gormDB.DB) *gormDB.DB { return db.Where("id = ?", req.GetId()) },
+	}); err != nil {
+		r.log.Errorf(ctx, "delete api failed: %s", err.Error())
+		return permissionV1.ErrorInternalServerError("delete api failed")
+	}
+
+	return nil
+}
+
+// ListAllIDs 列出全部 API 行 id。与 data 栈同名方法语义一致。
+func (r *ApiRepo) ListAllIDs(ctx context.Context) ([]int64, error) {
+	var ids []int64
+	if err := r.client.DB.WithContext(ctx).Model(&models.Api{}).Pluck("id", &ids).Error; err != nil {
+		r.log.Errorf(ctx, "list all api ids failed: %s", err.Error())
+		return nil, permissionV1.ErrorInternalServerError("list all api ids failed")
+	}
+	return ids, nil
+}
+
+// ListAll 列出全部 API 行。与 data 栈同名方法语义一致。
+func (r *ApiRepo) ListAll(ctx context.Context) ([]*permissionV1.Api, error) {
+	var entities []*models.Api
+	if err := r.client.DB.WithContext(ctx).Model(&models.Api{}).Find(&entities).Error; err != nil {
+		r.log.Errorf(ctx, "list all apis failed: %s", err.Error())
+		return nil, permissionV1.ErrorInternalServerError("list all apis failed")
+	}
+	dtos := make([]*permissionV1.Api, 0, len(entities))
+	for _, e := range entities {
+		dtos = append(dtos, r.mapper.ToDTO(e))
+	}
+	return dtos, nil
+}
+
+// CascadeDeleteBindings 按 (path, method) 级联清理权限绑定快照：API 行删除后
+// 调用，消灭孤儿绑定。与 data 栈同名方法语义一致。
+func (r *ApiRepo) CascadeDeleteBindings(ctx context.Context, path, method string) error {
+	if r.permissionApi == nil {
+		return permissionV1.ErrorInternalServerError("permission api repo not wired")
+	}
+	return r.permissionApi.DeleteByEndpoints(ctx, r.client.DB.WithContext(ctx), path, method)
+}
+
+// SyncMerge 接口同步 MERGE：以 (path, method) 自然键单事务增量对齐 spec 与库存，
+// 删除段级联清绑定。与 data 栈同名方法语义一致（id 永不重排、授权零漂移）。
+// operatorId 为 0 表示系统身份（启动期播种）。
+func (r *ApiRepo) SyncMerge(ctx context.Context, apis []*permissionV1.Api, operatorID int64) (added, updated, removed int, err error) {
+	if r.permissionApi == nil {
+		return 0, 0, 0, permissionV1.ErrorInternalServerError("permission api repo not wired")
+	}
+
+	now := time.Now()
+	txErr := r.client.DB.WithContext(ctx).Transaction(func(tx *gormDB.DB) error {
+		var existing []*models.Api
+		if err := tx.Model(&models.Api{}).Find(&existing).Error; err != nil {
+			r.log.Errorf(ctx, "query existing apis for sync failed: %s", err.Error())
+			return permissionV1.ErrorInternalServerError("query apis failed")
+		}
+
+		existingByKey := make(map[string]*models.Api, len(existing))
+		for _, row := range existing {
+			if row == nil || row.Path == nil || row.Method == nil {
+				continue
+			}
+			existingByKey[(Endpoint{Path: *row.Path, Method: *row.Method}).key()] = row
+		}
+
+		specKeys := make(map[string]struct{}, len(apis))
+		for _, dto := range apis {
+			if dto == nil || dto.GetPath() == "" || dto.GetMethod() == "" {
+				continue
+			}
+			key := (Endpoint{Path: dto.GetPath(), Method: dto.GetMethod()}).key()
+			if _, dup := specKeys[key]; dup {
+				continue
+			}
+			specKeys[key] = struct{}{}
+
+			if exist, ok := existingByKey[key]; ok {
+				if r.apiMetadataEqual(exist, dto) {
+					continue
+				}
+				updates := map[string]any{
+					"module":             dto.GetModule(),
+					"module_description": dto.GetModuleDescription(),
+					"description":        dto.GetDescription(),
+					"operation":          dto.GetOperation(),
+					"business_module":    dto.GetBusinessModule().String(),
+					"updated_at":         now,
+				}
+				if operatorID != 0 {
+					updates["updated_by"] = operatorID
+				}
+				if err := tx.Model(&models.Api{}).Where("id = ?", exist.ID).Updates(updates).Error; err != nil {
+					r.log.Errorf(ctx, "sync merge update api [%s %s] failed: %s", dto.GetMethod(), dto.GetPath(), err.Error())
+					return permissionV1.ErrorInternalServerError("sync merge update api failed")
+				}
+				updated++
+				continue
+			}
+
+			row := &models.Api{
+				Description:       dto.Description,
+				Module:            dto.Module,
+				ModuleDescription: dto.ModuleDescription,
+				Operation:         dto.Operation,
+				Path:              dto.Path,
+				Method:            dto.Method,
+				BusinessModule:    trans.Ptr(dto.GetBusinessModule().String()),
+			}
+			if operatorID != 0 {
+				row.CreatedBy = trans.Ptr(operatorID)
+			}
+			// created_at/updated_at 由 mixin BeforeCreate 钩子自动填充
+			if err := tx.Create(row).Error; err != nil {
+				r.log.Errorf(ctx, "sync merge create api [%s %s] failed: %s", dto.GetMethod(), dto.GetPath(), err.Error())
+				return permissionV1.ErrorInternalServerError("sync merge create api failed")
+			}
+			added++
+		}
+
+		// 删除段：库有 spec 无 → 删行 + 级联清绑定（同事务，防孤儿绑定）
+		for key, row := range existingByKey {
+			if _, ok := specKeys[key]; ok {
+				continue
+			}
+			if err := tx.Delete(&models.Api{}, row.ID).Error; err != nil {
+				r.log.Errorf(ctx, "sync merge delete api [%s %s] failed: %s", *row.Method, *row.Path, err.Error())
+				return permissionV1.ErrorInternalServerError("sync merge delete api failed")
+			}
+			if err := r.permissionApi.DeleteByEndpoints(ctx, tx, *row.Path, *row.Method); err != nil {
+				return err
+			}
+			removed++
+		}
+
+		return nil
+	})
+	if txErr != nil {
+		return added, updated, removed, txErr
+	}
+	return added, updated, removed, nil
+}
+
+// apiMetadataEqual 判断 MERGE 更新段是否需要落库：仅比较同步会写入的元数据列。
+// 与 data 栈同口径。
+func (r *ApiRepo) apiMetadataEqual(entity *models.Api, dto *permissionV1.Api) bool {
+	if entity == nil || dto == nil {
+		return false
+	}
+	strEq := func(a, b *string) bool {
+		if a == nil && b == nil {
+			return true
+		}
+		if a == nil || b == nil {
+			return false
+		}
+		return *a == *b
+	}
+
+	wantBM := dto.GetBusinessModule().String()
+	if wantBM == identityV1.Module_MODULE_UNSPECIFIED.String() {
+		if entity.BusinessModule != nil && *entity.BusinessModule != "" {
+			return false
+		}
+	} else if entity.BusinessModule == nil || *entity.BusinessModule != wantBM {
+		return false
+	}
+
+	return strEq(entity.Module, dto.Module) &&
+		strEq(entity.ModuleDescription, dto.ModuleDescription) &&
+		strEq(entity.Description, dto.Description) &&
+		strEq(entity.Operation, dto.Operation)
+}

@@ -1,0 +1,79 @@
+import {
+  useMutation,
+  type UseMutationOptions,
+} from '@tanstack/vue-query';
+import type {
+  printservicev1_CreatePrintTemplateRequest,
+  printservicev1_DeletePrintTemplateRequest,
+  printservicev1_GeneratePrintTemplateRequest,
+  printservicev1_GeneratePrintTemplateResponse,
+} from '#/api/generated/admin/service/v1';
+
+import { makeUpdateMask, type PaginationQuery } from '#/transport/rest';
+
+import { apiClient } from '#/api/client';
+import { queryClient } from '#/plugins/vue-query';
+
+// ==============================
+// 打印模板（单据打印设计器 TemplateData 载体）
+// ==============================
+
+export async function fetchListPrintTemplates(params: PaginationQuery) {
+  return queryClient.fetchQuery({
+    queryKey: ['listPrintTemplates', params],
+    queryFn: () => apiClient.printTemplateService.List(params.toRawParams()),
+    retry: 0,
+  });
+}
+
+export function useCreatePrintTemplate(
+  options?: UseMutationOptions<{}, Error, printservicev1_CreatePrintTemplateRequest>
+) {
+  return useMutation({
+    mutationFn: (data) => apiClient.printTemplateService.Create(data),
+    ...options,
+  });
+}
+
+export function useUpdatePrintTemplate(
+  options?: UseMutationOptions<
+    {},
+    Error,
+    { id: string; values: Record<string, any> }
+  >
+) {
+  return useMutation({
+    mutationFn: ({ id, values }: { id: string; values: Record<string, any> }) =>
+      apiClient.printTemplateService.Update({
+        id,
+        data: { ...values } as any,
+        updateMask: makeUpdateMask(Object.keys(values ?? {})),
+      }),
+    ...options,
+  });
+}
+
+export function useDeletePrintTemplate(
+  options?: UseMutationOptions<{}, Error, printservicev1_DeletePrintTemplateRequest>
+) {
+  return useMutation({
+    mutationFn: (req) => apiClient.printTemplateService.Delete(req),
+    ...options,
+  });
+}
+
+// useGeneratePrintTemplate AI 一句话生成模板（M4-1）：描述单据要素 →
+// 后端 LLM 产出 TemplateData（护栏校验后返回，未入库）。调用方拿到 payload
+// 后预览确认，再走 useCreatePrintTemplate 保存。
+export function useGeneratePrintTemplate(
+  options?: UseMutationOptions<
+    printservicev1_GeneratePrintTemplateResponse,
+    Error,
+    printservicev1_GeneratePrintTemplateRequest
+  >
+) {
+  return useMutation({
+    mutationFn: (req) => apiClient.printTemplateService.GenerateTemplate(req),
+    ...options,
+  });
+}
