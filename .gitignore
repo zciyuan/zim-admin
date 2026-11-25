@@ -57,3 +57,10 @@ login-resp.json
 
 # SeaweedFS 本机容器数据卷（docker bind mount，仅本机开发环境）
 .seaweedfs-data/
+
+# Local runtime artifacts (binaries, logs, screenshots, probe scripts)
+/run/
+/backend/run/
+
+# Local-only service configs (contain real DB/Redis credentials)
+/backend/app/admin/service/configs-local/
